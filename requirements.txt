@@ -1,0 +1,8 @@
+# Codec and command line
+numpy
+pillow
+# Optional: opens HEIC/HEIF photos (iPhone)
+# pillow-heif
+# Benchmark (compare.py) only
+# opencv-python
+# scipy

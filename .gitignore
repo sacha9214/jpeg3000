@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.j3k
+!web/astronaut.j3k
+.venv/
+.claude/

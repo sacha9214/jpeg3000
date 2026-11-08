@@ -3,41 +3,141 @@
 
 Usage : python test_jpeg3000.py
 """
+import io
+import os
+
 import numpy as np
 
 import jpeg3000 as j3
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def photo():
+    """Une vraie photo si une est disponible (test-images/), sinon None."""
+    path = os.path.join(HERE, "test-images", "astronaut.png")
+    return j3.read_image(path)[100:300, 150:450].copy() if os.path.exists(path) else None
+
 
 def test_wavelet_is_invertible():
-    x = np.random.RandomState(0).rand(64, 96) * 255
+    x = np.random.RandomState(0).rand(67, 95) * 255
     for levels in (1, 3, 5):
         assert np.abs(j3.idwt2(j3.dwt2(x, levels), levels) - x).max() < 1e-9
+    for n in (1, 2, 3, 4, 5, 7, 8, 13):  # toutes les longueurs, paires et impaires
+        v = np.random.RandomState(n).rand(3, n)
+        assert np.abs(j3._inv(*j3._fwd(v)) - v).max() < 1e-9, n
 
 
 def test_round_trip():
     rng = np.random.RandomState(0)
+    alpha = np.where(rng.rand(45, 31) < 0.5, 0, 255).astype(np.uint8)
+    alpha[10:20, 5:25] = np.arange(20, dtype=np.uint8) * 13
     cases = {
         "bruit 37x53": (rng.rand(37, 53, 3) * 255).astype(np.uint8),
         "gris 61x40": (rng.rand(61, 40) * 255).astype(np.uint8),
         "1x1": np.array([[[10, 200, 30]]], dtype=np.uint8),
         "2x5 gris": (rng.rand(2, 5) * 255).astype(np.uint8),
+        "1x40 gris": (rng.rand(1, 40) * 255).astype(np.uint8),
+        "33x1": (rng.rand(33, 1, 3) * 255).astype(np.uint8),
         "uni 33x33": np.full((33, 33, 3), 77, np.uint8),
-        "dégradé 100x150": np.dstack(np.meshgrid(np.arange(150), np.arange(100)) + [np.full((100, 150), 90)])
+        "dégradé 100x150": np.dstack(list(np.meshgrid(np.arange(150), np.arange(100))) + [np.full((100, 150), 90)])
         .astype(np.uint8),
+        "RGBA 45x31": np.dstack([(rng.rand(45, 31, 3) * 255).astype(np.uint8), alpha]),
+        "gris+alpha 45x31": np.dstack([(rng.rand(45, 31) * 255).astype(np.uint8), alpha]),
     }
-    try:
-        from scipy.misc import face
-        cases["photo 200x300"] = face()[100:300, 300:600].copy()
-    except ImportError:
-        pass
+    if photo() is not None:
+        cases["photo 200x300"] = photo()
     for name, img in cases.items():
         for step in (0.3, 4, 30, 400):
             out = j3.decode(j3.encode(img, step))
-            assert out.shape == img.shape, name
+            assert out.shape == img.shape, (name, out.shape)
             assert np.array_equal(out, j3.simulate(img, step)), (name, step)
+            if img.ndim == 3 and img.shape[2] in (2, 4):
+                assert np.array_equal(out[..., -1], img[..., -1]), name  # transparence sans perte
+
+
+def test_opaque_alpha_is_dropped():
+    img = np.dstack([np.full((20, 20, 3), 100, np.uint8), np.full((20, 20), 255, np.uint8)])
+    assert j3.decode(j3.encode(img, 4)).shape == (20, 20, 3)
+
+
+def test_bad_files_are_rejected():
+    good = j3.encode(np.zeros((8, 8), np.uint8), 4)
+    for data, words in [(b"", "pas un fichier"), (b"PNG...." * 4, "pas un fichier"),
+                        (b"J3K2" + good[4:], "autre version"),
+                        (good[:4] + b"\x00" * 8 + good[12:], "abîmé")]:
+        try:
+            j3.decode(data)
+        except ValueError as e:
+            assert words in str(e), (words, str(e))
+        else:
+            raise AssertionError("fichier invalide accepté : " + words)
+
+
+NODE_DECODE = """
+const fs = require("fs"), path = require("path");
+const J3K = require(process.argv[1]);
+for (const f of fs.readdirSync(process.argv[2]).filter((f) => f.endsWith(".j3k"))) {
+  const im = J3K.decode(fs.readFileSync(path.join(process.argv[2], f)));
+  fs.writeFileSync(path.join(process.argv[2], f + ".raw"), im.data);
+}
+"""
+
+
+def test_javascript_decoder_matches():
+    """Le décodeur du navigateur (web/j3k.js) doit donner exactement les mêmes pixels."""
+    import shutil
+    import subprocess
+    import tempfile
+    node = shutil.which("node")
+    if not node:
+        print("(node absent : test du décodeur JavaScript sauté)")
+        return
+    rng = np.random.RandomState(2)
+    cases = {
+        "rgb": (rng.rand(37, 53, 3) * 255).astype(np.uint8),
+        "gris": (rng.rand(61, 40) * 255).astype(np.uint8),
+        "1x1": np.array([[[10, 200, 30]]], dtype=np.uint8),
+        "1x40": (rng.rand(1, 40) * 255).astype(np.uint8),
+        "rgba": np.dstack([(rng.rand(45, 31, 3) * 255).astype(np.uint8), (rng.rand(45, 31) * 255).astype(np.uint8)]),
+        "gris+alpha": np.dstack([(rng.rand(20, 9) * 255).astype(np.uint8), np.full((20, 9), 9, np.uint8)]),
+    }
+    if photo() is not None:
+        cases["photo"] = photo()
+    expected = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, img in cases.items():
+            for step in (0.3, 4, 30, 400):
+                data = j3.encode(img, step)
+                fname = "{}-{}.j3k".format(name, step)
+                with open(os.path.join(tmp, fname), "wb") as f:
+                    f.write(data)
+                expected[fname] = j3.decode(data)
+        subprocess.run([node, "-e", NODE_DECODE, os.path.join(HERE, "web", "j3k.js"), tmp], check=True)
+        for fname, img in expected.items():
+            with open(os.path.join(tmp, fname + ".raw"), "rb") as f:
+                got = np.frombuffer(f.read(), np.uint8)
+            assert np.array_equal(got, img.reshape(-1)), fname
+
+
+def test_pillow_opens_j3k():
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    img = np.dstack([(np.random.RandomState(1).rand(30, 41, 3) * 255).astype(np.uint8),
+                     np.full((30, 41), 128, np.uint8)])
+    data = j3.encode(img, 8)
+    with Image.open(io.BytesIO(data)) as im:
+        assert im.format == "J3K" and im.mode == "RGBA" and im.size == (41, 30)
+        assert np.array_equal(np.asarray(im), j3.decode(data))
 
 
 if __name__ == "__main__":
     test_wavelet_is_invertible()
     test_round_trip()
+    test_opaque_alpha_is_dropped()
+    test_bad_files_are_rejected()
+    test_pillow_opens_j3k()
+    test_javascript_decoder_matches()
     print("Tous les tests passent.")
