@@ -3,18 +3,24 @@
 
 Comment ça marche, en 4 étapes :
   1. Couleurs : RGB -> YCbCr (luminosité + 2 couleurs), comme le JPEG.
-  2. Transformée en ondelettes CDF 9/7 sur toute l'image (comme JPEG 2000)
-     au lieu de blocs 8x8 : plus d'effet « pavés » quand on compresse fort.
+  2. Transformée en ondelettes CDF 9/7 sur toute l'image (comme JPEG 2000), de n'importe
+     quelle taille, au lieu de blocs 8x8 : plus d'effet « pavés » quand on compresse fort.
   3. Quantification à zone morte, avec un pas adapté à chaque sous-bande et une
      zone morte qui dépend du voisinage (on garde la texture, on jette le bruit isolé).
-  4. Codage arithmétique adaptatif avec contextes (voisins, coefficient parent et,
-     pour les couleurs, la luminosité au même endroit), plus efficace que le
-     codage de Huffman du JPEG.
+  4. Codage arithmétique adaptatif avec contextes (voisins, coefficient parent, bandes
+     voisines et, pour les couleurs, la luminosité au même endroit). La décision la plus
+     fréquente (« ce coefficient est-il nul ? ») mélange 4 modèles avec un petit réseau
+     qui apprend pendant le codage, comme les compresseurs de la famille PAQ.
+
+La transparence (canal alpha) est gardée telle quelle, sans perte.
 
 Usage :
   python jpeg3000.py encode photo.png photo.j3k --quality 50
   python jpeg3000.py encode photo.png photo.j3k --size 50000     (taille visée en octets)
   python jpeg3000.py decode photo.j3k photo_decodee.png
+  python jpeg3000.py info photo.j3k
+
+Après `import jpeg3000`, Pillow sait aussi ouvrir les .j3k : Image.open("photo.j3k").
 """
 import argparse
 import os
@@ -23,15 +29,19 @@ import time
 
 import numpy as np
 
-MAGIC = b"J3K2"
-HEADER = struct.Struct("<4sHHBBff")  # magie, largeur, hauteur, canaux, niveaux, pas, facteur chroma
+MAGIC = b"J3K3"
+# magie, largeur, hauteur, canaux (1 gris, 2 gris+alpha, 3 RGB, 4 RGBA), niveaux, pas, facteur chroma
+HEADER = struct.Struct("<4sIIBBff")
+MAX_PIXELS = 1 << 28
 
 CHROMA = 1.6     # les couleurs sont quantifiées plus fort que la luminosité (l'œil y est moins sensible)
 RHO = 0.25       # zone morte : arrondi vers zéro des petits coefficients
 RHO_ISO = 0.10   # ... plus forte pour un coefficient isolé (cher à coder, peu visible)
 RHO_BUSY = 0.40  # ... plus faible au milieu d'une texture (peu cher à coder, garde le détail)
 BIAS = 0.05      # point de reconstruction à l'intérieur de chaque intervalle
-BLOCK = 4        # taille des blocs testés « tout à zéro » d'un seul coup
+BLOCK = 32       # côté des blocs testés « tout à zéro » d'un seul coup
+MAX_LEVELS = 6   # niveaux d'ondelette au plus...
+MIN_LL = 8       # ... tant que la bande basse fréquence garde au moins 8 pixels de côté
 
 # ---------------------------------------------------------------------------
 # 1. Couleurs
@@ -63,96 +73,119 @@ DELTA = 0.443506852043971
 K = 1.230174104914001
 
 
-def _next(a):  # a[n+1], miroir au bord droit
-    return np.concatenate([a[..., 1:], a[..., -1:]], axis=-1)
-
-
-def _prev(a):  # a[n-1], miroir au bord gauche
-    return np.concatenate([a[..., :1], a[..., :-1]], axis=-1)
+def _sides(s, d):
+    """Voisins avec extension symétrique (comme JPEG 2000), pour une longueur paire ou impaire.
+    Renvoie s[k+1] pour chaque d[k], puis d[k-1] et d[k] pour chaque s[k]."""
+    ns, nd = s.shape[-1], d.shape[-1]
+    s_next = s[..., 1:] if ns > nd else np.concatenate([s[..., 1:], s[..., -1:]], axis=-1)
+    d_prev = np.concatenate([d[..., :1], d[..., :ns - 1]], axis=-1)
+    d_cur = np.concatenate([d, d[..., -1:]], axis=-1) if ns > nd else d
+    return s_next, d_prev, d_cur
 
 
 def _fwd(x):
-    """Une étape d'analyse le long du dernier axe (longueur paire) -> (basses, hautes fréquences)."""
+    """Une étape d'analyse le long du dernier axe (toute longueur) -> (basses, hautes fréquences)."""
     s = x[..., 0::2].copy()
     d = x[..., 1::2].copy()
-    d += ALPHA * (s + _next(s))
-    s += BETA * (_prev(d) + d)
-    d += GAMMA * (s + _next(s))
-    s += DELTA * (_prev(d) + d)
+    nd = d.shape[-1]
+    if not nd:  # un seul échantillon : rien à transformer
+        return s, d
+    d += ALPHA * (s[..., :nd] + _sides(s, d)[0])
+    _, dp, dc = _sides(s, d)
+    s += BETA * (dp + dc)
+    d += GAMMA * (s[..., :nd] + _sides(s, d)[0])
+    _, dp, dc = _sides(s, d)
+    s += DELTA * (dp + dc)
     return s / K, d * K
 
 
 def _inv(s, d):
+    nd = d.shape[-1]
+    if not nd:
+        return s.copy()
     s = s * K
     d = d / K
-    s -= DELTA * (_prev(d) + d)
-    d -= GAMMA * (s + _next(s))
-    s -= BETA * (_prev(d) + d)
-    d -= ALPHA * (s + _next(s))
-    x = np.empty(s.shape[:-1] + (2 * s.shape[-1],))
+    _, dp, dc = _sides(s, d)
+    s -= DELTA * (dp + dc)
+    d -= GAMMA * (s[..., :nd] + _sides(s, d)[0])
+    _, dp, dc = _sides(s, d)
+    s -= BETA * (dp + dc)
+    d -= ALPHA * (s[..., :nd] + _sides(s, d)[0])
+    x = np.empty(s.shape[:-1] + (s.shape[-1] + nd,))
     x[..., 0::2] = s
     x[..., 1::2] = d
     return x
 
 
+def level_sizes(h, w, levels):
+    """Taille de la zone basse fréquence à chaque niveau : (h, w), (⌈h/2⌉, ⌈w/2⌉)..."""
+    sizes = [(h, w)]
+    for _ in range(levels):
+        h, w = (h + 1) >> 1, (w + 1) >> 1
+        sizes.append((h, w))
+    return sizes
+
+
 def dwt2(img, levels):
     a = img.astype(np.float64)
-    h, w = a.shape
-    for _ in range(levels):
+    for h, w in level_sizes(*a.shape, levels)[:-1]:
         lo, hi = _fwd(a[:h, :w])                          # le long des lignes
         lo, hi = _fwd(np.concatenate([lo, hi], axis=1).T)  # le long des colonnes
         a[:h, :w] = np.concatenate([lo, hi], axis=1).T
-        h //= 2
-        w //= 2
     return a
 
 
 def idwt2(a, levels):
     a = a.copy()
-    H, W = a.shape
+    sizes = level_sizes(*a.shape, levels)
     for lev in range(levels, 0, -1):
-        h, w = H >> (lev - 1), W >> (lev - 1)
+        (h, w), (lh, lw) = sizes[lev - 1], sizes[lev]
         t = a[:h, :w].T
-        sub = _inv(t[:, :h // 2], t[:, h // 2:]).T
-        a[:h, :w] = _inv(sub[:, :w // 2], sub[:, w // 2:])
+        sub = _inv(t[:, :lh], t[:, lh:]).T
+        a[:h, :w] = _inv(sub[:, :lw], sub[:, lw:])
     return a
 
 
-def _synthesis_norms(max_levels=7, n=4096):
-    """Énergie de chaque fonction de base : sert à donner à chaque sous-bande le bon pas de quantification."""
-    low, high = {}, {}
-    for lev in range(1, max_levels + 1):
-        for store, is_high in ((low, False), (high, True)):
-            m = n >> lev
-            s, d = np.zeros(m), np.zeros(m)
-            (d if is_high else s)[m // 2] = 1.0
-            x = _inv(s, d)
-            for _ in range(lev - 1):
-                x = _inv(x, np.zeros_like(x))
-            store[lev] = float(np.sqrt(np.sum(x * x)))
-    return low, high
-
-
-_LOW, _HIGH = _synthesis_norms()
+# Énergie des fonctions de base de chaque niveau (basse, haute fréquence), calculée une fois
+# pour toutes : elle donne à chaque sous-bande le bon pas de quantification. En dur pour que
+# tous les décodeurs (Python, JavaScript...) utilisent exactement les mêmes nombres.
+_LOW = [1.0, 1.4021081679297438, 2.030371856081801, 2.9011625562785768, 4.115285175175844,
+        5.824510863772892, 8.238759934572657, 11.651954647921327, 16.47856064706484]
+_HIGH = [1.0, 0.721261382508076, 0.9834713041227895, 1.4419624041394556, 2.0737604196716712,
+         2.94732487653393, 4.173589458929619, 5.904302327552499, 8.350639020782582]
 
 LL, HL, LH, HH = range(4)
 
 
 def band_specs(H, W, levels):
     """Sous-bandes dans l'ordre de codage : (niveau, orientation, lignes, colonnes, norme)."""
-    h, w = H >> levels, W >> levels
-    specs = [(levels, LL, slice(0, h), slice(0, w), _LOW[levels] ** 2)]
+    sizes = level_sizes(H, W, levels)
+    h, w = sizes[levels]
+    specs = [(levels, LL, slice(0, h), slice(0, w), _LOW[levels] * _LOW[levels])]
     for lev in range(levels, 0, -1):
-        h, w = H >> lev, W >> lev
-        specs.append((lev, HL, slice(0, h), slice(w, 2 * w), _HIGH[lev] * _LOW[lev]))
-        specs.append((lev, LH, slice(h, 2 * h), slice(0, w), _LOW[lev] * _HIGH[lev]))
-        specs.append((lev, HH, slice(h, 2 * h), slice(w, 2 * w), _HIGH[lev] ** 2))
+        (h, w), (lh, lw) = sizes[lev - 1], sizes[lev]
+        specs.append((lev, HL, slice(0, lh), slice(lw, w), _HIGH[lev] * _LOW[lev]))
+        specs.append((lev, LH, slice(lh, h), slice(0, lw), _LOW[lev] * _HIGH[lev]))
+        specs.append((lev, HH, slice(lh, h), slice(lw, w), _HIGH[lev] * _HIGH[lev]))
     return specs
 
 
 # ---------------------------------------------------------------------------
 # 3. Quantification
 # ---------------------------------------------------------------------------
+
+
+def _parent_map(parent, h, w):
+    """Valeur du coefficient parent (échelle 2 fois plus grossière) en face de chaque position."""
+    ph, pw = parent.shape
+    return parent[np.minimum(np.arange(h) >> 1, ph - 1)][:, np.minimum(np.arange(w) >> 1, pw - 1)]
+
+
+def _same_scale(band, h, w):
+    """Une bande de la même échelle (autre orientation, ou luminosité), recadrée sur h x w."""
+    b = np.asarray(band, dtype=np.int64).reshape(len(band), -1)
+    bh, bw = b.shape
+    return b[np.minimum(np.arange(h), bh - 1)][:, np.minimum(np.arange(w), bw - 1)]
 
 
 def _quantize_detail(c, step, parent):
@@ -163,8 +196,8 @@ def _quantize_detail(c, step, parent):
     p = np.pad((q > 0).astype(np.int8), 1)
     n = sum(p[1 + dy:1 + dy + h, 1 + dx:1 + dx + w]
             for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx)
-    if parent is not None:
-        n = n + np.repeat(np.repeat(parent != 0, 2, axis=0), 2, axis=1)
+    if parent is not None and parent.size:
+        n = n + _parent_map(parent != 0, h, w)
     q = np.where(n == 0, np.floor(a + RHO_ISO), np.where(n >= 3, np.floor(a + RHO_BUSY), q))
     return (np.sign(c) * q).astype(np.int64)
 
@@ -231,6 +264,19 @@ class Encoder:
             self._shift_low()
         return b
 
+    def code(self, p0, b):
+        """Bit b avec une probabilité de 0 donnée sur 12 bits (1 à 4095)."""
+        bound = (self.range >> 12) * p0
+        if b:
+            self.low += bound
+            self.range -= bound
+        else:
+            self.range = bound
+        while self.range < TOP:
+            self.range <<= 8
+            self._shift_low()
+        return b
+
     def bypass(self, b):
         self.range >>= 1
         if b:
@@ -263,7 +309,7 @@ class Decoder:
         self.data = data
         self.pos = pos + 4
         self.range = 0xFFFFFFFF
-        self.code = int.from_bytes(data[pos:pos + 4].ljust(4, b"\x00"), "big")
+        self.val = int.from_bytes(data[pos:pos + 4].ljust(4, b"\x00"), "big")
 
     def _byte(self):
         p = self.pos
@@ -274,61 +320,110 @@ class Decoder:
         i += i
         pf, ps = probs[i], probs[i + 1]
         bound = (self.range >> 12) * ((pf + ps) >> 5)
-        if self.code < bound:
+        if self.val < bound:
             self.range = bound
             probs[i] = pf + ((65536 - pf) >> 4)
             probs[i + 1] = ps + ((65536 - ps) >> 7)
             b = 0
         else:
-            self.code -= bound
+            self.val -= bound
             self.range -= bound
             probs[i] = pf - (pf >> 4)
             probs[i + 1] = ps - (ps >> 7)
             b = 1
         while self.range < TOP:
             self.range <<= 8
-            self.code = (self.code << 8) | self._byte()
+            self.val = (self.val << 8) | self._byte()
+        return b
+
+    def code(self, p0, _b=0):
+        bound = (self.range >> 12) * p0
+        if self.val < bound:
+            self.range = bound
+            b = 0
+        else:
+            self.val -= bound
+            self.range -= bound
+            b = 1
+        while self.range < TOP:
+            self.range <<= 8
+            self.val = (self.val << 8) | self._byte()
         return b
 
     def bypass(self, _b=0):
         self.range >>= 1
-        if self.code >= self.range:
-            self.code -= self.range
+        if self.val >= self.range:
+            self.val -= self.range
             b = 1
         else:
             b = 0
         while self.range < TOP:
             self.range <<= 8
-            self.code = (self.code << 8) | self._byte()
+            self.val = (self.val << 8) | self._byte()
         return b
 
     def ue(self, probs, base, _v=0):
         n = 0
         while self.bit(probs, base + (n if n < 19 else 19)):
             n += 1
+            if n > 40:
+                raise ValueError("fichier .j3k abîmé (valeur impossible)")
         v = 1
         for _ in range(n):
             v = (v << 1) | self.bypass()
         return v - 1
 
 
+# Mélange logistique (comme les compresseurs PAQ) : plusieurs modèles donnent chacun une
+# probabilité, un petit réseau apprend en continu comment les combiner. Uniquement des
+# calculs entiers, pour que tous les décodeurs (Python, JavaScript...) tombent pile pareil.
+_SQT = [1, 2, 3, 6, 10, 16, 27, 45, 73, 120, 194, 310, 488, 747, 1101, 1546, 2047, 2549, 2994,
+        3348, 3607, 3785, 3901, 3975, 4022, 4050, 4068, 4079, 4085, 4089, 4092, 4093, 4094]
+
+
+def _squash(d):
+    """Domaine logistique (-2047..2047) -> probabilité sur 12 bits (1..4095)."""
+    w, i = d & 127, (d >> 7) + 16
+    return max(1, (_SQT[i] * (128 - w) + _SQT[i + 1] * w + 64) >> 7)
+
+
+SQUASH = [_squash(d) for d in range(-2047, 2048)]  # SQUASH[d + 2047]
+STRETCH = [2047] * 4096                             # l'inverse : probabilité -> domaine logistique
+_lo = 0
+for _d in range(-2047, 2048):
+    for _p in range(_lo, SQUASH[_d + 2047] + 1):
+        STRETCH[_p] = _d
+    _lo = max(_lo, SQUASH[_d + 2047] + 1)
+MIX_W0 = 19660   # poids de départ de chaque modèle dans le mélange (0,3 en virgule fixe 16 bits)
+MIX_SHIFT = 11   # vitesse d'apprentissage du mélangeur (plus grand = plus lent)
+
+
 # ---------------------------------------------------------------------------
 # Modèle de contexte : le même code sert à l'encodage et au décodage
-# (Q = valeurs à coder, ou None pour décoder ; R se remplit au fur et à mesure).
+# (q = valeurs à coder, ou None pour décoder ; R se remplit au fur et à mesure).
 # ---------------------------------------------------------------------------
 
 # Regroupement de l'« activité » des voisins déjà codés en quelques classes.
 SBIN = [0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7]
-MBIN = [0, 0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4]
+# Classes d'amplitude à échelle logarithmique : 0, 1, 2, 3-4, 5-6, 7-10, 11-16, 17-28, 29-48, 49 et plus.
+MLOG = [0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6] + [7] * 12 + [8] * 20 + [9] * 15
 
 
 class _BandModel:
     def __init__(self):
         self.blk = _probs(18)
-        self.sig = _probs(48)
-        self.gt1 = _probs(10)
-        self.gt2 = _probs(10)
-        self.eg = _probs(200)
+        self.gt1 = _probs(20)
+        self.gt2 = _probs(20)
+        self.eg = _probs(400)
+        self.sgn = _probs(27)
+        # « Ce coefficient est-il nul ? » : 4 modèles mélangés. Le contexte principal à deux
+        # vitesses, un motif fin des voisins proches, un contexte large (voisins à 2 pas,
+        # bandes cousines, luminosité) ; probabilités de 1 sur 16 bits.
+        self.sfa = [32768] * 48
+        self.ssa = [32768] * 48
+        self.smb = [32768] * 162
+        self.smc = [32768] * 108
+        self.mw = [MIX_W0, MIX_W0, MIX_W0, MIX_W0, 0] * 8
 
 
 class _Models:
@@ -338,7 +433,8 @@ class _Models:
 
 
 def _code_ll(rc, probs, Q, R, h, w):
-    """Bande basse fréquence : prédiction à partir des voisins (comme JPEG-LS), puis le résidu."""
+    """Prédiction à partir des voisins (comme JPEG-LS), puis le résidu. Sert pour la bande
+    basse fréquence et pour la transparence (sans perte)."""
     enc = Q is not None
     ue = rc.ue
     for y in range(h):
@@ -362,12 +458,41 @@ def _code_ll(rc, probs, Q, R, h, w):
             row[x] = pred + ((u >> 1) if not u & 1 else -((u + 1) >> 1))
 
 
-def _code_band(rc, model, Q, R, P, X, h, w):
-    """Bande haute fréquence. P = bande « parente » (même orientation, échelle plus grossière),
-    X = même bande de la luminosité, déjà décodée (pour les couleurs ; None pour la luminosité)."""
-    enc = Q is not None
-    bit, bypass, ue = rc.bit, rc.bypass, rc.ue
-    blk, sig, gt1, gt2, eg = model.blk, model.sig, model.gt1, model.gt2, model.eg
+def _block_any(m, h, w):
+    """Pour chaque bloc BLOCK x BLOCK : y a-t-il au moins une valeur non nulle ?"""
+    nbh, nbw = -(-h // BLOCK), -(-w // BLOCK)
+    p = np.zeros((nbh * BLOCK, nbw * BLOCK), dtype=bool)
+    p[:h, :w] = m != 0
+    return p.reshape(nbh, BLOCK, nbw, BLOCK).any(axis=(1, 3)).astype(np.int64).tolist()
+
+
+def _code_band(rc, model, q, R, P, C, X, h, w):
+    """Bande haute fréquence. Contextes déjà connus du décodeur avant de la coder :
+    P = bande « parente » (même orientation, échelle 2 fois plus grossière),
+    C = bandes « cousines » (même échelle, orientations déjà codées),
+    X = même bande de la luminosité (pour les couleurs ; None pour la luminosité)."""
+    if not h or not w:
+        return
+    enc = q is not None
+    bit, code, ue = rc.bit, rc.code, rc.ue
+    blk, gt1, gt2, eg, sgn = model.blk, model.gt1, model.gt2, model.eg, model.sgn
+    sfa, ssa, smb, smc, mw = model.sfa, model.ssa, model.smb, model.smc, model.mw
+    ST, SQ, SH = STRETCH, SQUASH, MIX_SHIFT
+    Q = q.tolist() if enc else None
+    zero = np.zeros((h, w), dtype=np.int64)
+    pv = _parent_map(np.asarray(P, dtype=np.int64), h, w) if P and P[0] else None
+    xv = _same_scale(X, h, w) if X is not None else None
+    cv = zero
+    for c in C:
+        if c and c[0]:
+            cv = cv + np.abs(_same_scale(c, h, w))
+    qb = _block_any(q, h, w) if enc else None
+    pb = _block_any(pv, h, w) if pv is not None else None
+    xb = _block_any(xv, h, w) if xv is not None else None
+    pm = np.minimum(np.abs(pv if pv is not None else zero), 2).tolist()
+    xs = (np.sign(xv) + 1).tolist() if xv is not None else None
+    xm = np.minimum(np.abs(xv if xv is not None else zero), 2).tolist()
+    cm = np.minimum(cv, 2).tolist()
     nbh, nbw = -(-h // BLOCK), -(-w // BLOCK)
     flags = [[0] * nbw for _ in range(nbh)]
     for by in range(nbh):
@@ -375,70 +500,101 @@ def _code_band(rc, model, Q, R, P, X, h, w):
         for bx in range(nbw):
             x0, x1 = bx * BLOCK, min(bx * BLOCK + BLOCK, w)
             # a) Le bloc contient-il au moins un coefficient non nul ?
-            nz = enc and any(any(Q[y][x0:x1]) for y in range(y0, y1))
             c = (flags[by - 1][bx] if by else 0) + (flags[by][bx - 1] if bx else 0)
-            if P is None:
-                pc = 2
-            else:
-                px0, px1 = x0 >> 1, (x1 + 1) >> 1
-                pc = 1 if any(any(P[y][px0:px1]) for y in range(y0 >> 1, (y1 + 1) >> 1)) else 0
-            lb = 1 if X is not None and any(any(X[y][x0:x1]) for y in range(y0, y1)) else 0
-            nz = bit(blk, 2 * (3 * c + pc) + lb, nz)
-            flags[by][bx] = nz
+            pc = pb[by][bx] if pb is not None else 2
+            lb = xb[by][bx] if xb is not None else 0
+            nz = flags[by][bx] = bit(blk, 2 * (3 * c + pc) + lb, qb[by][bx] if enc else 0)
             if not nz:
                 continue
             # b) Les coefficients du bloc, un par un.
             for y in range(y0, y1):
                 row = R[y]
                 up = R[y - 1] if y else None
-                prow = P[y >> 1] if P is not None else None
-                xrow = X[y] if X is not None else None
+                up2 = R[y - 2] if y > 1 else None
+                pmr, cmr, xmr = pm[y], cm[y], xm[y]
+                xsr = xs[y] if xs is not None else None
                 qrow = Q[y] if enc else None
                 for x in range(x0, x1):
-                    sn = 2 * abs(row[x - 1]) if x else 0
+                    l1 = abs(row[x - 1]) if x else 0
+                    u1 = dg = 0
                     if up is not None:
-                        sn += 2 * abs(up[x])
+                        u1 = abs(up[x])
                         if x:
-                            sn += abs(up[x - 1])
+                            dg = abs(up[x - 1])
                         if x + 1 < w:
-                            sn += abs(up[x + 1])
-                    p = abs(prow[x >> 1]) if prow is not None else 0
-                    if p > 2:
-                        p = 2
-                    lc = 1 if xrow is not None and xrow[x] else 0
+                            dg += abs(up[x + 1])
+                    sn = 2 * (l1 + u1) + dg
+                    p = pmr[x]
+                    lc = 1 if xsr is not None and xsr[x] != 1 else 0
                     v = qrow[x] if enc else 0
                     m = abs(v)
-                    if bit(sig, 2 * (3 * SBIN[sn if sn < 15 else 15] + p) + lc, m):
-                        mc = sn + 2 * p
-                        mc = 2 * MBIN[mc if mc < 15 else 15] + lc
-                        if bit(gt1, mc, m > 1):
-                            if bit(gt2, mc, m > 2):
-                                m = 3 + ue(eg, 20 * mc, m - 3)
-                            else:
-                                m = 2
+                    # Nul ou pas ? Mélange de 4 prédictions, chacune issue d'un contexte différent.
+                    sb = SBIN[sn if sn < 15 else 15]
+                    ca = 2 * (3 * sb + p) + lc
+                    cb = ((((l1 if l1 < 2 else 2) * 3 + (u1 if u1 < 2 else 2)) * 3 + (dg if dg < 2 else 2)) * 3
+                          + p) * 2 + lc
+                    fr = (abs(row[x - 2]) if x > 1 else 0) + (abs(up2[x]) if up2 is not None else 0)
+                    cc = (((fr if fr < 3 else 3) * 3 + cmr[x]) * 3 + xmr[x]) * 3 + p
+                    pa, ps, pb_, pc_ = sfa[ca], ssa[ca], smb[cb], smc[cc]
+                    s0, s1, s2, s3 = ST[pa >> 4], ST[ps >> 4], ST[pb_ >> 4], ST[pc_ >> 4]
+                    k = 5 * sb
+                    dot = (mw[k] * s0 + mw[k + 1] * s1 + mw[k + 2] * s2 + mw[k + 3] * s3 + mw[k + 4] * 256) >> 16
+                    p1 = SQ[(dot if dot < 2047 else 2047) + 2047] if dot > -2047 else 1
+                    b = code(4096 - p1, 1 if m else 0)
+                    err = (b << 12) - p1
+                    mw[k] += (s0 * err) >> SH
+                    mw[k + 1] += (s1 * err) >> SH
+                    mw[k + 2] += (s2 * err) >> SH
+                    mw[k + 3] += (s3 * err) >> SH
+                    mw[k + 4] += (256 * err) >> SH
+                    if not b:
+                        sfa[ca] = pa - (pa >> 4)
+                        ssa[ca] = ps - (ps >> 7)
+                        smb[cb] = pb_ - (pb_ >> 5)
+                        smc[cc] = pc_ - (pc_ >> 5)
+                        continue
+                    sfa[ca] = pa + ((65536 - pa) >> 4)
+                    ssa[ca] = ps + ((65536 - ps) >> 7)
+                    smb[cb] = pb_ + ((65536 - pb_) >> 5)
+                    smc[cc] = pc_ + ((65536 - pc_) >> 5)
+                    # Amplitude : 1, 2, puis Exp-Golomb, selon l'activité autour.
+                    mc = sn + 2 * p
+                    mc = 2 * MLOG[mc if mc < 64 else 63] + lc
+                    if bit(gt1, mc, m > 1):
+                        if bit(gt2, mc, m > 2):
+                            m = 3 + ue(eg, 20 * mc, m - 3)
                         else:
-                            m = 1
-                        row[x] = -m if bypass(v < 0) else m
+                            m = 2
+                    else:
+                        m = 1
+                    # Signe : prédit par les voisins de gauche et du dessus (et la luminosité).
+                    sl = row[x - 1] if x else 0
+                    su = up[x] if up is not None else 0
+                    sc = 3 * ((sl > 0) - (sl < 0) + 1) + (su > 0) - (su < 0) + 1
+                    if xsr is not None:
+                        sc = 3 * sc + xsr[x]
+                    row[x] = -m if bit(sgn, sc, v < 0) else m
 
 
-def _code_planes(rc, nplanes, H, W, levels, qbands=None):
-    specs = band_specs(H, W, levels)
+def _code_planes(rc, ncolor, h, w, levels, qbands=None):
+    specs = band_specs(h, w, levels)
     luma, chroma = _Models(), _Models()
     out = []
-    for ci in range(nplanes):
+    for ci in range(ncolor):
         models = chroma if ci else luma
         parents = {}
         bands = []
         for bi, (lev, o, ys, xs, _) in enumerate(specs):
-            h, w = ys.stop - ys.start, xs.stop - xs.start
-            Q = qbands[ci][bi].tolist() if qbands is not None else None
-            R = [[0] * w for _ in range(h)]
+            bh, bw = ys.stop - ys.start, xs.stop - xs.start
+            q = qbands[ci][bi] if qbands is not None else None
+            R = [[0] * bw for _ in range(bh)]
             if o == LL:
-                _code_ll(rc, models.dc, Q, R, h, w)
+                _code_ll(rc, models.dc, q.tolist() if q is not None else None, R, bh, bw)
             else:
                 model = models.bands[2 * (min(lev, 4) - 1) + (o == HH)]
                 X = out[0][bi] if ci else None
-                _code_band(rc, model, Q, R, parents.get(o), X, h, w)
+                C = [bands[bi - k] for k in range(1, o)]
+                _code_band(rc, model, q, R, parents.get(o), C, X, bh, bw)
                 parents[o] = R
             bands.append(R)
         out.append(bands)
@@ -452,33 +608,34 @@ def _code_planes(rc, nplanes, H, W, levels, qbands=None):
 
 def _levels_for(h, w):
     m, levels = min(h, w), 1
-    while levels < 6 and (m >> (levels + 1)) >= 8:
+    while levels < MAX_LEVELS and (m >> (levels + 1)) >= MIN_LL:
         levels += 1
     return levels
 
 
-def _padded(n, levels):
-    unit = 1 << levels
-    return -(-n // unit) * unit
-
-
 def prepare(img):
-    """Transforme l'image une seule fois (pratique pour essayer plusieurs niveaux de compression)."""
+    """Transforme l'image une seule fois (pratique pour essayer plusieurs niveaux de compression).
+    Image : tableau uint8 HxW (gris), HxWx2 (gris + alpha), HxWx3 (RGB) ou HxWx4 (RGBA)."""
     img = np.asarray(img)
-    if img.dtype != np.uint8 or img.ndim not in (2, 3) or (img.ndim == 3 and img.shape[2] != 3):
-        raise ValueError("image attendue : tableau uint8 HxW (gris) ou HxWx3 (RGB)")
+    if img.dtype != np.uint8 or img.ndim not in (2, 3) or (img.ndim == 3 and not 1 <= img.shape[2] <= 4):
+        raise ValueError("image attendue : tableau uint8 HxW (gris), HxWx2 (gris+alpha), "
+                         "HxWx3 (RGB) ou HxWx4 (RGBA)")
     h, w = img.shape[:2]
-    if h > 65535 or w > 65535:
-        raise ValueError("image trop grande (65535 pixels de côté maximum)")
+    if not h or not w or h * w > MAX_PIXELS:
+        raise ValueError("taille d'image non prise en charge : {}x{}".format(w, h))
+    if img.ndim == 2:
+        img = img[..., None]
+    color, alpha = (img[..., :-1], img[..., -1]) if img.shape[2] in (2, 4) else (img, None)
+    if alpha is not None and alpha.min() == 255:
+        alpha = None  # entièrement opaque : inutile de garder la transparence
     levels = _levels_for(h, w)
-    H, W = _padded(h, levels), _padded(w, levels)
-    planes = [img.astype(np.float64) - 128.0] if img.ndim == 2 else rgb_to_ycc(img)
-    coeffs = [dwt2(np.pad(p, ((0, H - h), (0, W - w)), mode="symmetric"), levels) for p in planes]
-    return {"h": h, "w": w, "H": H, "W": W, "levels": levels, "coeffs": coeffs}
+    planes = [color[..., 0].astype(np.float64) - 128.0] if color.shape[2] == 1 else rgb_to_ycc(color)
+    coeffs = [dwt2(p, levels) for p in planes]
+    return {"h": h, "w": w, "levels": levels, "coeffs": coeffs, "alpha": alpha}
 
 
 def _quantize_all(prep, step, chroma):
-    specs = band_specs(prep["H"], prep["W"], prep["levels"])
+    specs = band_specs(prep["h"], prep["w"], prep["levels"])
     out = []
     for ci, a in enumerate(prep["coeffs"]):
         st = step * (chroma if ci else 1.0)
@@ -494,23 +651,32 @@ def _quantize_all(prep, step, chroma):
     return out
 
 
-def _reconstruct(qbands, h, w, H, W, levels, step, chroma):
-    specs = band_specs(H, W, levels)
+def _reconstruct(qbands, h, w, levels, step, chroma, alpha=None):
+    specs = band_specs(h, w, levels)
     planes = []
     for ci, bands in enumerate(qbands):
         st = step * (chroma if ci else 1.0)
-        a = np.zeros((H, W))
+        a = np.zeros((h, w))
         for (_, o, ys, xs, norm), q in zip(specs, bands):
+            q = np.asarray(q, dtype=np.float64).reshape(ys.stop - ys.start, xs.stop - xs.start)
             a[ys, xs] = _dequantize(q, st / norm, o == LL)
-        planes.append(idwt2(a, levels)[:h, :w])
+        planes.append(idwt2(a, levels))
     if len(planes) == 1:
-        return np.clip(np.round(planes[0] + 128.0), 0, 255).astype(np.uint8)
-    return ycc_to_rgb(*planes)
+        img = np.clip(np.round(planes[0] + 128.0), 0, 255).astype(np.uint8)
+    else:
+        img = ycc_to_rgb(*planes)
+    if alpha is None:
+        return img
+    return np.dstack([img, np.asarray(alpha, dtype=np.uint8)])
 
 
 def quality_to_step(quality):
     """Qualité 1..100 (100 = presque sans perte) -> pas de quantification."""
     return 0.5 * 2.0 ** ((100.0 - quality) / 10.0)
+
+
+def step_to_quality(step):
+    return 100.0 - 10.0 * np.log2(step / 0.5)
 
 
 def _f32(x):
@@ -522,17 +688,24 @@ def simulate(img_or_prep, step):
     prep = img_or_prep if isinstance(img_or_prep, dict) else prepare(img_or_prep)
     step, chroma = _f32(step), _f32(CHROMA)
     q = _quantize_all(prep, step, chroma)
-    return _reconstruct(q, prep["h"], prep["w"], prep["H"], prep["W"], prep["levels"], step, chroma)
+    return _reconstruct(q, prep["h"], prep["w"], prep["levels"], step, chroma, prep["alpha"])
 
 
 def encode(img_or_prep, step):
-    """Image (uint8, gris ou RGB) -> octets .j3k."""
+    """Image (uint8 : gris, gris+alpha, RGB ou RGBA) -> octets .j3k."""
     prep = img_or_prep if isinstance(img_or_prep, dict) else prepare(img_or_prep)
     step, chroma = _f32(step), _f32(CHROMA)
+    if not (step > 0 and np.isfinite(step)):
+        raise ValueError("pas de quantification invalide : {}".format(step))
     q = _quantize_all(prep, step, chroma)
     rc = Encoder()
-    _code_planes(rc, len(q), prep["H"], prep["W"], prep["levels"], q)
-    header = HEADER.pack(MAGIC, prep["w"], prep["h"], len(q), prep["levels"], step, chroma)
+    _code_planes(rc, len(q), prep["h"], prep["w"], prep["levels"], q)
+    alpha = prep["alpha"]
+    if alpha is not None:
+        _code_ll(rc, _probs(60), alpha.astype(np.int64).tolist(), [[0] * prep["w"] for _ in range(prep["h"])],
+                 prep["h"], prep["w"])
+    nch = len(q) + (alpha is not None)
+    header = HEADER.pack(MAGIC, prep["w"], prep["h"], nch, prep["levels"], step, chroma)
     return header + rc.finish()
 
 
@@ -551,41 +724,156 @@ def encode_to_size(img_or_prep, max_bytes, iterations=12):
     return best
 
 
-def decode(data):
-    """Octets .j3k -> image uint8 (HxW ou HxWx3, RGB)."""
+def read_header(data):
+    """En-tête d'un .j3k -> dict (largeur, hauteur, canaux, niveaux, pas, chroma)."""
     if len(data) < HEADER.size or data[:4] != MAGIC:
+        if data[:3] == b"J3K" and len(data) >= 4:
+            raise ValueError("fichier JPEG 3000 d'une autre version ({}) : ce décodeur lit {}".format(
+                data[:4].decode("ascii", "replace"), MAGIC.decode()))
         raise ValueError("ce n'est pas un fichier JPEG 3000 (.j3k)")
     _, w, h, nch, levels, step, chroma = HEADER.unpack_from(data)
-    H, W = _padded(h, levels), _padded(w, levels)
-    bands = _code_planes(Decoder(data, HEADER.size), nch, H, W, levels)
-    return _reconstruct(bands, h, w, H, W, levels, step, chroma)
+    if not (1 <= nch <= 4 and 1 <= levels <= 8 and w and h and w * h <= MAX_PIXELS
+            and step > 0 and np.isfinite(step) and chroma > 0 and np.isfinite(chroma)):
+        raise ValueError("fichier .j3k abîmé (en-tête incohérent)")
+    return {"width": w, "height": h, "channels": nch, "levels": levels, "step": step, "chroma": chroma}
+
+
+def decode(data):
+    """Octets .j3k -> image uint8 (HxW, HxWx2, HxWx3 ou HxWx4)."""
+    hd = read_header(data)
+    w, h, nch = hd["width"], hd["height"], hd["channels"]
+    ncolor = 1 if nch <= 2 else 3
+    rc = Decoder(data, HEADER.size)
+    bands = _code_planes(rc, ncolor, h, w, hd["levels"])
+    alpha = None
+    if nch in (2, 4):
+        alpha = [[0] * w for _ in range(h)]
+        _code_ll(rc, _probs(60), None, alpha, h, w)
+        alpha = np.clip(np.array(alpha, dtype=np.int64), 0, 255)
+    return _reconstruct(bands, h, w, hd["levels"], hd["step"], hd["chroma"], alpha)
 
 
 # ---------------------------------------------------------------------------
-# Ligne de commande (lecture/écriture PNG, JPEG, BMP... via OpenCV)
+# Lecture / écriture des images classiques (Pillow de préférence, sinon OpenCV)
 # ---------------------------------------------------------------------------
+
+
+def _from_pil(im):
+    """Image Pillow -> tableau uint8 gris / gris+alpha / RGB / RGBA, dans le bon sens (EXIF)."""
+    from PIL import ImageOps
+    im = ImageOps.exif_transpose(im)  # photos de téléphone : on applique l'orientation EXIF
+    has_alpha = "A" in im.getbands() or "transparency" in im.info
+    if im.mode in ("I;16", "I;16L", "I;16B", "I", "F"):  # gris 16 ou 32 bits -> 8 bits
+        a = np.asarray(im, dtype=np.float64)
+        top = 65535.0 if a.max() > 255 else 255.0
+        return np.clip(np.round(a * (255.0 / top)), 0, 255).astype(np.uint8)
+    if im.mode == "1" or im.mode == "L":
+        mode = "LA" if has_alpha else "L"
+    elif im.mode in ("LA", "La", "PA"):
+        mode = "LA"
+    else:
+        mode = "RGBA" if has_alpha else "RGB"
+    if im.mode != mode:
+        im = im.convert(mode)
+    return np.ascontiguousarray(np.asarray(im, dtype=np.uint8))
 
 
 def read_image(path):
-    import cv2
+    """Lit PNG, JPEG, WebP, TIFF, BMP, GIF, AVIF (et HEIC si pillow-heif est installé)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        Image = None
+    if Image is not None:
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except ImportError:
+            pass
+        try:
+            with Image.open(path) as im:
+                return _from_pil(im)
+        except (OSError, ValueError, SyntaxError) as e:
+            error = e
+    try:
+        import cv2
+    except ImportError:
+        raise SystemExit("Impossible de lire l'image : " + path +
+                         (" ({})".format(error) if Image is not None else " (installez Pillow : pip install pillow)"))
     img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise SystemExit("Impossible de lire l'image : " + path)
     if img.dtype != np.uint8:
         img = (img / 257.0).round().astype(np.uint8)  # 16 bits -> 8 bits
     if img.ndim == 3:
-        img = img[..., 0] if img.shape[2] == 1 else img[..., 2::-1]  # BGR(A) -> RGB
+        img = img[..., 0] if img.shape[2] == 1 else img[..., [2, 1, 0, 3][:img.shape[2]]]  # BGR(A) -> RGB(A)
     return np.ascontiguousarray(img)
 
 
 def write_image(path, img):
+    """Écrit PNG, JPEG, WebP, TIFF, BMP... selon l'extension (PNG si aucune)."""
+    ext = (os.path.splitext(path)[1] or ".png").lower()
+    if img.ndim == 3 and img.shape[2] in (2, 4) and ext in (".jpg", ".jpeg", ".bmp"):
+        # Format sans transparence : on pose l'image sur un fond blanc.
+        a = img[..., -1:].astype(np.float64) / 255.0
+        img = np.round(img[..., :-1] * a + 255.0 * (1.0 - a)).astype(np.uint8)
+        img = img[..., 0] if img.shape[2] == 1 else img
+    try:
+        from PIL import Image
+        options = {"quality": 95} if ext in (".jpg", ".jpeg", ".webp") else {}
+        Image.fromarray(img).save(path, **options)
+        return
+    except ImportError:
+        pass
     import cv2
-    ext = os.path.splitext(path)[1] or ".png"
-    bgr = img if img.ndim == 2 else img[..., ::-1]
-    ok, buf = cv2.imencode(ext, bgr)
+    if img.ndim == 3:
+        img = img[..., [2, 1, 0, 3][:img.shape[2]]] if img.shape[2] in (3, 4) else img[..., :1]
+    ok, buf = cv2.imencode(ext, img)
     if not ok:
         raise SystemExit("Impossible d'écrire l'image : " + path)
     buf.tofile(path)
+
+
+def register_pillow():
+    """Apprend à Pillow à ouvrir les .j3k (Image.open("photo.j3k"))."""
+    from PIL import Image, ImageFile
+
+    class J3KImageFile(ImageFile.ImageFile):
+        format = "J3K"
+        format_description = "JPEG 3000"
+
+        def _open(self):
+            hd = read_header(self.fp.read(HEADER.size))
+            mode = ("L", "LA", "RGB", "RGBA")[hd["channels"] - 1]
+            if isinstance(getattr(type(self), "mode", None), property):
+                self._mode = mode
+            else:
+                self.mode = mode
+            self._size = (hd["width"], hd["height"])
+            tile = ("j3k", (0, 0) + self._size, 0, None)
+            self.tile = [ImageFile._Tile(*tile) if hasattr(ImageFile, "_Tile") else tile]
+
+    class J3KDecoder(ImageFile.PyDecoder):
+        _pulls_fd = True
+
+        def decode(self, buffer):
+            self.fd.seek(0)
+            self.set_as_raw(np.ascontiguousarray(decode(self.fd.read())).tobytes())
+            return -1, 0
+
+    Image.register_open(J3KImageFile.format, J3KImageFile, lambda prefix: prefix[:4] == MAGIC)
+    Image.register_extension(J3KImageFile.format, ".j3k")
+    Image.register_decoder("j3k", J3KDecoder)
+
+
+try:
+    register_pillow()
+except ImportError:
+    pass
+
+
+def _n(n):
+    return "{:,}".format(n).replace(",", " ")
 
 
 def main(argv=None):
@@ -597,9 +885,11 @@ def main(argv=None):
     g = e.add_mutually_exclusive_group()
     g.add_argument("--quality", type=float, default=50, help="1 à 100 (défaut 50)")
     g.add_argument("--size", type=int, help="taille maximale du fichier, en octets")
-    d = sub.add_parser("decode", help=".j3k -> image (PNG, BMP...)")
+    d = sub.add_parser("decode", help=".j3k -> image (PNG, JPEG, WebP, BMP...)")
     d.add_argument("entree")
     d.add_argument("sortie")
+    i = sub.add_parser("info", help="décrit un fichier .j3k sans le décoder")
+    i.add_argument("entree")
     args = ap.parse_args(argv)
 
     t0 = time.time()
@@ -609,18 +899,31 @@ def main(argv=None):
         if args.size:
             data, _ = encode_to_size(img, args.size)
         else:
-            data = encode(img, quality_to_step(args.quality))
+            data = encode(img, quality_to_step(min(max(args.quality, 1.0), 100.0)))
         with open(args.sortie, "wb") as f:
             f.write(data)
-        print("{} ({}x{}) -> {} : {:,} octets ({:.2f} bit/pixel) en {:.1f} s".format(
-            args.entree, w, h, args.sortie, len(data), 8 * len(data) / (w * h),
-            time.time() - t0).replace(",", " "))
+        print("{} ({}x{}) -> {} : {} octets ({:.2f} bit/pixel) en {:.1f} s".format(
+            args.entree, w, h, args.sortie, _n(len(data)), 8 * len(data) / (w * h), time.time() - t0))
     elif args.cmd == "decode":
         with open(args.entree, "rb") as f:
-            img = decode(f.read())
+            try:
+                img = decode(f.read())
+            except ValueError as err:
+                raise SystemExit("{} : {}".format(args.entree, err))
         write_image(args.sortie, img)
         print("{} -> {} ({}x{}) en {:.1f} s".format(
             args.entree, args.sortie, img.shape[1], img.shape[0], time.time() - t0))
+    elif args.cmd == "info":
+        with open(args.entree, "rb") as f:
+            data = f.read()
+        try:
+            hd = read_header(data)
+        except ValueError as err:
+            raise SystemExit("{} : {}".format(args.entree, err))
+        kind = ("gris", "gris + transparence", "couleur", "couleur + transparence")[hd["channels"] - 1]
+        print("{} : JPEG 3000 ({}), {}x{}, {}, qualité {:.0f}, {} octets ({:.2f} bit/pixel)".format(
+            args.entree, MAGIC.decode(), hd["width"], hd["height"], kind, step_to_quality(hd["step"]),
+            _n(len(data)), 8 * len(data) / (hd["width"] * hd["height"])))
     else:
         ap.print_help()
 
