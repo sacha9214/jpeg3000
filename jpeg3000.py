@@ -41,7 +41,8 @@ OLD_MAGICS = (b"J3K3",)  # versions encore lues (J3K3 = v3, sans ondelette direc
 HEADER = struct.Struct("<4sIIBBff")
 MAX_PIXELS = 1 << 28
 
-CHROMA = 1.6     # les couleurs sont quantifiées plus fort que la luminosité (l'œil y est moins sensible)
+CHROMA = 1.7     # les couleurs sont quantifiées plus fort que la luminosité (l'œil y est moins sensible)...
+CHROMA_GAMMA = -0.2  # ... un peu moins à forte compression, un peu plus à haute qualité (mesuré)
 RHO = 0.25       # zone morte : arrondi vers zéro des petits coefficients
 RHO_ISO = 0.10   # ... plus forte pour un coefficient isolé (cher à coder, peu visible)
 RHO_BUSY = 0.40  # ... plus faible au milieu d'une texture (peu cher à coder, garde le détail)
@@ -231,18 +232,16 @@ def _expand(blocks, m, n):
 
 
 def _choose(x):
-    """Encodeur : direction de chaque bloc, celle qui prédit le mieux les échantillons impairs."""
+    """Encodeur : direction de chaque bloc, celle qui laisse le moins d'énergie dans les hautes
+    fréquences après l'étape complète de lifting (calculée pour chaque direction)."""
     m, n = x.shape
     nbm, nbn = _grid(m, n)
-    s, d = x[:, 0::2], x[:, 1::2]
-    nd = d.shape[1]
-    if not nd:
+    if n < 2:
         return np.full((nbm, nbn), ZERO, dtype=np.int64)
-    sn = _sides(s, d)[0]
     costs = np.zeros((len(OFFS), nbm, nbn))
     full = np.zeros((nbm * DIR_BLOCK, nbn * DIR_BLOCK))
-    for i, off in enumerate(OFFS):
-        full[:m, 1:n:2] = np.abs(d - 0.5 * (_shift0(s[:, :nd], -off) + _shift0(sn, off)))
+    for i in range(len(OFFS)):
+        full[:m, 1:n:2] = np.abs(_fwd_dir(x, np.full(x.shape, i))[1])
         costs[i] = full.reshape(nbm, DIR_BLOCK, nbn, DIR_BLOCK).sum(axis=(1, 3))
     best = costs.argmin(axis=0)
     best[costs[ZERO] <= costs.min(axis=0) * (1 + DIR_MIN_GAIN)] = ZERO
@@ -536,6 +535,8 @@ for _d in range(-2047, 2048):
     _lo = max(_lo, SQUASH[_d + 2047] + 1)
 COST = [32.0] + [-np.log2(p / 4096.0) for p in range(1, 4096)] + [0.0]  # bits pour une probabilité 12 bits
 RDO_LAMBDA = 0.08  # poids du débit dans la quantification RDO (0 = désactivée)
+ZERO_BLOCK_MAX = 4      # un bloc qui ne garde que quelques ±1 (au plus 4)...
+ZERO_BLOCK_BITS = 8.0   # ... est vidé si l'erreur ajoutée vaut moins que ces bits par valeur (et ses zéros)
 LEVEL1_STEP = 1.1  # J3K4 : détails les plus fins quantifiés 10 % plus grossièrement (mesuré : un peu mieux)
 
 
@@ -911,6 +912,23 @@ def prepare(img):
     return {"h": h, "w": w, "levels": levels, "coeffs": coeffs, "alpha": alpha, "dirs": dirs}
 
 
+def _zero_sparse_blocks(q, av):
+    """Encodeur : un bloc BLOCK x BLOCK qui ne garde que quelques ±1 coûte son drapeau, ses zéros et
+    ces valeurs ; on le vide si l'erreur ajoutée vaut moins que les bits gagnés (même poids que la RDO)."""
+    h, w = q.shape
+    q = q.copy()
+    for y0 in range(0, h, BLOCK):
+        for x0 in range(0, w, BLOCK):
+            b = q[y0:y0 + BLOCK, x0:x0 + BLOCK]
+            nz = np.count_nonzero(b)
+            if not nz or nz > ZERO_BLOCK_MAX or np.abs(b).max() > 1:
+                continue
+            a = av[y0:y0 + BLOCK, x0:x0 + BLOCK][b != 0]
+            if np.sum(a * a - (a - 1 - BIAS) ** 2) < RDO_LAMBDA * (ZERO_BLOCK_BITS * nz + 0.02 * b.size):
+                b[:] = 0
+    return q
+
+
 def _quantize_all(prep, step, chroma, amps=None):
     """Quantification de départ ; amps (liste) reçoit les coefficients exacts en pas de quantification."""
     specs = band_specs(prep["h"], prep["w"], prep["levels"])
@@ -925,6 +943,8 @@ def _quantize_all(prep, step, chroma, amps=None):
             else:
                 sb_ = _band_step(st, norm, lev, o)
                 q = _quantize_detail(a[ys, xs], sb_, parents.get(o))
+                if amps is not None and RDO_LAMBDA > 0:
+                    q = _zero_sparse_blocks(q, np.abs(a[ys, xs]) / sb_)
                 parents[o] = q
                 exact.append((a[ys, xs] / sb_).tolist() if amps is not None else None)
             bands.append(q)
@@ -966,10 +986,15 @@ def _f32(x):
     return float(np.float32(x))
 
 
+def chroma_for(step):
+    """Facteur des couleurs choisi par l'encodeur (écrit dans le fichier : le décodeur n'a rien à savoir)."""
+    return CHROMA * (step / 12.0) ** CHROMA_GAMMA
+
+
 def encode_full(img_or_prep, step):
     """Image -> (octets .j3k, image telle qu'elle sera décodée)."""
     prep = img_or_prep if isinstance(img_or_prep, dict) else prepare(img_or_prep)
-    step, chroma = _f32(step), _f32(CHROMA)
+    step, chroma = _f32(step), _f32(chroma_for(step))
     if not (step > 0 and np.isfinite(step)):
         raise ValueError("pas de quantification invalide : {}".format(step))
     amps = [] if RDO_LAMBDA > 0 else None
@@ -997,7 +1022,7 @@ def simulate(img_or_prep, step):
     prep = img_or_prep if isinstance(img_or_prep, dict) else prepare(img_or_prep)
     if RDO_LAMBDA > 0:
         return encode_full(prep, step)[1]
-    step, chroma = _f32(step), _f32(CHROMA)
+    step, chroma = _f32(step), _f32(chroma_for(step))
     q = _quantize_all(prep, step, chroma)
     return _reconstruct(q, prep["h"], prep["w"], prep["levels"], step, chroma, prep["alpha"], prep["dirs"])
 
