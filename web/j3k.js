@@ -19,7 +19,8 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
-  const MAGIC = "J3K3";
+  const MAGIC = "J3K4";
+  const OLD_MAGICS = ["J3K3"];  // versions encore lues (J3K3 = v3, sans ondelette directionnelle)
   const HEADER_SIZE = 22;
   const MAX_PIXELS = 1 << 28;
   const BIAS = 0.05;
@@ -27,6 +28,11 @@
   const TOP = 1 << 24;
   const MIX_W0 = 19660;
   const MIX_SHIFT = 11;
+  const LEVEL1_STEP = 1.1;
+  // Ondelette directionnelle (J3K4) : décalage latéral de chaque direction, blocs de 16.
+  const OFFS = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+  const ZERO = 3;
+  const DIR_BLOCK = 16;
 
   // Ondelette CDF 9/7 et énergie de ses fonctions de base (mêmes nombres que jpeg3000.py).
   const ALPHA = -1.586134342059924, BETA = -0.052980118572961, GAMMA = 0.882911075530934;
@@ -147,13 +153,20 @@
 
   const probs = (n) => new Int32Array(2 * n).fill(32768);
 
+  function mixWeights(sets) {
+    const w = new Float64Array(5 * sets);
+    for (let i = 0; i < w.length; i++) w[i] = i % 5 === 4 ? 0 : MIX_W0;
+    return w;
+  }
+
   function bandModel() {
-    const mw = new Float64Array(40);
-    for (let i = 0; i < 40; i++) mw[i] = i % 5 === 4 ? 0 : MIX_W0;
+    const mw = mixWeights(8);
     return {
       blk: probs(18), gt1: probs(20), gt2: probs(20), eg: probs(400), sgn: probs(27),
       sfa: new Int32Array(48).fill(32768), ssa: new Int32Array(48).fill(32768),
       smb: new Int32Array(162).fill(32768), smc: new Int32Array(108).fill(32768), mw,
+      gfa: new Int32Array(20).fill(32768), gsa: new Int32Array(20).fill(32768),
+      gmb: new Int32Array(384).fill(32768), gmc: new Int32Array(108).fill(32768), gw: mixWeights(10),
     };
   }
 
@@ -196,7 +209,7 @@
   }
 
   // Bande haute fréquence : miroir exact de _code_band() dans jpeg3000.py.
-  function codeBand(rc, md, band, P, C, X) {
+  function codeBand(rc, md, band, P, C, X, v4) {
     const h = band.h, w = band.w, R = band.d, n = h * w;
     if (!h || !w) return;
     let pv = null, xv = null;
@@ -234,7 +247,7 @@
       }
       cm[i] = Math.min(cv[i], 2);
     }
-    const { blk, gt1, gt2, eg, sgn, sfa, ssa, smb, smc, mw } = md;
+    const { blk, gt1, gt2, eg, sgn, sfa, ssa, smb, smc, mw, gfa, gsa, gmb, gmc, gw } = md;
     const nbh = Math.ceil(h / BLOCK), nbw = Math.ceil(w / BLOCK);
     const flags = new Uint8Array(nbh * nbw);
     for (let by = 0; by < nbh; by++) {
@@ -291,8 +304,39 @@
             // Amplitude.
             let mc = sn + 2 * p;
             mc = 2 * MLOG[mc < 64 ? mc : 63] + lc;
+            let gb1;
+            if (v4) {  // « amplitude > 1 ? » : mélange de 4 modèles, comme pour « nul ? »
+              const ga = mc;
+              const gb = ((((l1 < 3 ? l1 : 3) * 4 + (u1 < 3 ? u1 : 3)) * 4 + (dg < 3 ? dg : 3)) * 3 + p) * 2 + lc;
+              const gc = cc;
+              const qa = gfa[ga], qs = gsa[ga], qb = gmb[gb], qc = gmc[gc];
+              const t0 = STRETCH[qa >> 4], t1 = STRETCH[qs >> 4], t2 = STRETCH[qb >> 4], t3 = STRETCH[qc >> 4];
+              const kg = 5 * (mc >> 1);
+              const gdot = Math.floor((gw[kg] * t0 + gw[kg + 1] * t1 + gw[kg + 2] * t2 + gw[kg + 3] * t3 + gw[kg + 4] * 256) / 65536);
+              const g1p = gdot > -2047 ? SQUASH[(gdot < 2047 ? gdot : 2047) + 2047] : 1;
+              gb1 = rc.code(4096 - g1p);
+              const gerr = gb1 * 4096 - g1p;
+              gw[kg] += (t0 * gerr) >> MIX_SHIFT;
+              gw[kg + 1] += (t1 * gerr) >> MIX_SHIFT;
+              gw[kg + 2] += (t2 * gerr) >> MIX_SHIFT;
+              gw[kg + 3] += (t3 * gerr) >> MIX_SHIFT;
+              gw[kg + 4] += (256 * gerr) >> MIX_SHIFT;
+              if (gb1) {
+                gfa[ga] = qa + ((65536 - qa) >> 4);
+                gsa[ga] = qs + ((65536 - qs) >> 7);
+                gmb[gb] = qb + ((65536 - qb) >> 5);
+                gmc[gc] = qc + ((65536 - qc) >> 5);
+              } else {
+                gfa[ga] = qa - (qa >> 4);
+                gsa[ga] = qs - (qs >> 7);
+                gmb[gb] = qb - (qb >> 5);
+                gmc[gc] = qc - (qc >> 5);
+              }
+            } else {
+              gb1 = rc.bit(gt1, mc);
+            }
             let m = 1;
-            if (rc.bit(gt1, mc)) m = rc.bit(gt2, mc) ? 3 + rc.ue(eg, 20 * mc) : 2;
+            if (gb1) m = rc.bit(gt2, mc) ? 3 + rc.ue(eg, 20 * mc) : 2;
             // Signe.
             const sl = x ? R[i - 1] : 0, su = y ? R[i - w] : 0;
             let sc = 3 * (Math.sign(sl) + 1) + Math.sign(su) + 1;
@@ -368,6 +412,115 @@
     }
   }
 
+  // --- Ondelette directionnelle inverse (J3K4) : miroir de _inv_dir / idwt2_dir de jpeg3000.py ---
+
+  // Colonne col de A (m lignes de n valeurs), lue à la ligne i + off (interpolation linéaire, bords répétés).
+  function sh(A, n, m, i, col, off) {
+    const lo = Math.floor(off), f = off - lo;
+    let i0 = i + lo;
+    i0 = i0 < 0 ? 0 : i0 >= m ? m - 1 : i0;
+    if (f === 0) return A[i0 * n + col];
+    let i1 = i + lo + 1;
+    i1 = i1 < 0 ? 0 : i1 >= m ? m - 1 : i1;
+    return A[i0 * n + col] * (1 - f) + A[i1 * n + col] * f;
+  }
+
+  // Synthèse le long des lignes : s (m x ns) basses fréquences, d (m x nd) hautes, dm (m x (ns+nd)) directions.
+  function invDir(s, d, m, ns, nd, dm) {
+    const n = ns + nd, x = new Float64Array(m * n);
+    if (!nd) {
+      x.set(s);
+      return x;
+    }
+    const S = new Float64Array(m * ns), D = new Float64Array(m * nd);
+    for (let i = 0; i < m * ns; i++) S[i] = s[i] * K;
+    for (let i = 0; i < m * nd; i++) D[i] = d[i] / K;
+    const updateS = (c) => {  // S -= c * (d[k-1] + d[k]), voisins pris selon la direction
+      for (let i = 0; i < m; i++) {
+        for (let k = 0; k < ns; k++) {
+          const off = OFFS[dm[i * n + 2 * k]];
+          const a = sh(D, nd, m, i, k ? k - 1 : 0, -off), b = sh(D, nd, m, i, k < nd ? k : nd - 1, off);
+          S[i * ns + k] = S[i * ns + k] - c * (a + b);
+        }
+      }
+    };
+    const updateD = (c) => {  // D -= c * (s[k] + s[k+1])
+      for (let i = 0; i < m; i++) {
+        for (let k = 0; k < nd; k++) {
+          const off = OFFS[dm[i * n + 2 * k + 1]];
+          const a = sh(S, ns, m, i, k, -off), b = sh(S, ns, m, i, k + 1 < ns ? k + 1 : ns - 1, off);
+          D[i * nd + k] = D[i * nd + k] - c * (a + b);
+        }
+      }
+    };
+    updateS(DELTA);
+    updateD(GAMMA);
+    updateS(BETA);
+    updateD(ALPHA);
+    for (let i = 0; i < m; i++) {
+      for (let k = 0; k < ns; k++) x[i * n + 2 * k] = S[i * ns + k];
+      for (let k = 0; k < nd; k++) x[i * n + 2 * k + 1] = D[i * nd + k];
+    }
+    return x;
+  }
+
+  function expandDirs(grid, m, n) {
+    const out = new Int32Array(m * n);
+    for (let i = 0; i < m; i++) {
+      const row = ((i / DIR_BLOCK) | 0) * grid.nc;
+      for (let k = 0; k < n; k++) out[i * n + k] = grid.g[row + ((k / DIR_BLOCK) | 0)];
+    }
+    return out;
+  }
+
+  function dirShapes(h, w, levels) {
+    const grid = (m, n) => [Math.ceil(m / DIR_BLOCK), Math.ceil(n / DIR_BLOCK)];
+    const shapes = [];
+    levelSizes(h, w, levels).slice(0, -1).forEach(([hh, ww]) => shapes.push(grid(ww, hh), grid(hh, ww)));
+    return shapes;
+  }
+
+  function codeDirs(rc, shapes) {
+    const pr = probs(2 * OFFS.length * 8), out = [];
+    shapes.forEach(([nr, nc], gi) => {
+      const g = new Int32Array(nr * nc);
+      let prev = ZERO;
+      for (let i = 0; i < nr * nc; i++) {
+        const base = ((gi & 1) * OFFS.length + prev) * 8;
+        let node = 1;
+        for (let b = 0; b < 3; b++) node = 2 * node + rc.bit(pr, base + node);
+        const sym = node - 8;
+        if (sym >= OFFS.length) throw new Error("corrupted .j3k file (impossible direction)");
+        g[i] = prev = sym;
+      }
+      out.push({ g, nr, nc });
+    });
+    return out;
+  }
+
+  function idwt2Dir(a, H, W, levels, dirs) {
+    const sizes = levelSizes(H, W, levels);
+    for (let lev = levels; lev >= 1; lev--) {
+      const [h, w] = sizes[lev - 1], [lh, lw] = sizes[lev];
+      const vb = dirs[2 * (lev - 1)], hb = dirs[2 * (lev - 1) + 1];
+      // Passe horizontale (le long des lignes).
+      const s = new Float64Array(h * lw), d = new Float64Array(h * (w - lw));
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < lw; x++) s[y * lw + x] = a[y * W + x];
+        for (let x = lw; x < w; x++) d[y * (w - lw) + x - lw] = a[y * W + x];
+      }
+      const v = invDir(s, d, h, lw, w - lw, expandDirs(hb, h, w));
+      // Passe verticale (le long des colonnes, sur la transposée).
+      const st = new Float64Array(w * lh), dt = new Float64Array(w * (h - lh));
+      for (let x = 0; x < w; x++) {
+        for (let y = 0; y < lh; y++) st[x * lh + y] = v[y * w + x];
+        for (let y = lh; y < h; y++) dt[x * (h - lh) + y - lh] = v[y * w + x];
+      }
+      const r = invDir(st, dt, w, lh, h - lh, expandDirs(vb, w, h));
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) a[y * W + x] = r[x * h + y];
+    }
+  }
+
   // Arrondi « au pair le plus proche » comme numpy.round, puis 0..255.
   function toByte(v) {
     let r = Math.floor(v);
@@ -381,7 +534,8 @@
   // ---------------------------------------------------------------------------
 
   function readHeader(bytes) {
-    if (bytes.length < HEADER_SIZE || String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== MAGIC) {
+    const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+    if (bytes.length < HEADER_SIZE || (magic !== MAGIC && !OLD_MAGICS.includes(magic))) {
       if (bytes.length >= 4 && String.fromCharCode(bytes[0], bytes[1], bytes[2]) === "J3K") {
         throw new Error("JPEG 3000 file from another version (J3K" + String.fromCharCode(bytes[3]) +
           "): this decoder reads " + MAGIC);
@@ -391,7 +545,7 @@
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const hd = {
       width: dv.getUint32(4, true), height: dv.getUint32(8, true), channels: bytes[12], levels: bytes[13],
-      step: dv.getFloat32(14, true), chroma: dv.getFloat32(18, true),
+      step: dv.getFloat32(14, true), chroma: dv.getFloat32(18, true), version: magic,
     };
     if (!(hd.channels >= 1 && hd.channels <= 4 && hd.levels >= 1 && hd.levels <= 8 && hd.width && hd.height &&
       hd.width * hd.height <= MAX_PIXELS && hd.step > 0 && isFinite(hd.step) && hd.chroma > 0 && isFinite(hd.chroma))) {
@@ -405,7 +559,9 @@
     const hd = readHeader(bytes);
     const { width: w, height: h, channels: nch, levels, step, chroma } = hd;
     const ncolor = nch <= 2 ? 1 : 3, n = w * h;
+    const v4 = hd.version === MAGIC;
     const rc = new RangeDecoder(bytes, HEADER_SIZE);
+    const dirs = v4 ? codeDirs(rc, dirShapes(h, w, levels)) : null;
     const specs = bandSpecs(h, w, levels);
     const luma = planeModels(), chromaModels = planeModels();
     const planesBands = [];
@@ -420,7 +576,7 @@
           const C = [];
           for (let k = 1; k < sp.o; k++) C.push(bands[bi - k]);
           codeBand(rc, md.bands[2 * (Math.min(sp.lev, 4) - 1) + (sp.o === HH ? 1 : 0)], band,
-            parents[sp.o] || null, C, ci ? planesBands[0][bi] : null);
+            parents[sp.o] || null, C, ci ? planesBands[0][bi] : null, v4);
           parents[sp.o] = band;
         }
         bands.push(band);
@@ -436,7 +592,7 @@
     const planes = planesBands.map((bands, ci) => {
       const st = step * (ci ? chroma : 1.0), a = new Float64Array(n);
       specs.forEach((sp, bi) => {
-        const s = st / sp.norm, q = bands[bi].d;
+        const s = sp.o !== LL && sp.lev === 1 && v4 ? st * LEVEL1_STEP / sp.norm : st / sp.norm, q = bands[bi].d;
         for (let y = sp.y0, j = 0; y < sp.y1; y++) {
           for (let x = sp.x0; x < sp.x1; x++, j++) {
             const v = q[j];
@@ -444,7 +600,8 @@
           }
         }
       });
-      idwt2(a, h, w, levels);
+      if (v4) idwt2Dir(a, h, w, levels, dirs);
+      else idwt2(a, h, w, levels);
       return a;
     });
     const data = new Uint8Array(n * nch);

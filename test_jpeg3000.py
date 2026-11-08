@@ -26,6 +26,14 @@ def test_wavelet_is_invertible():
     for n in (1, 2, 3, 4, 5, 7, 8, 13):  # toutes les longueurs, paires et impaires
         v = np.random.RandomState(n).rand(3, n)
         assert np.abs(j3._inv(*j3._fwd(v)) - v).max() < 1e-9, n
+    # Ondelette directionnelle : directions choisies par l'encodeur, puis directions au hasard.
+    for shape in ((67, 95), (1, 9), (40, 1), (33, 64)):
+        x = np.random.RandomState(1).rand(*shape) * 255
+        a, dirs = j3.dwt2_dir(x, 3)
+        assert np.abs(j3.idwt2_dir(a, 3, dirs) - x).max() < 1e-9, shape
+        rnd = [np.random.RandomState(i).randint(0, len(j3.OFFS), g.shape) for i, g in enumerate(dirs)]
+        a, _ = j3.dwt2_dir(x, 3, rnd)
+        assert np.abs(j3.idwt2_dir(a, 3, rnd) - x).max() < 1e-9, shape
 
 
 def test_round_trip():
@@ -56,6 +64,14 @@ def test_round_trip():
                 assert np.array_equal(out[..., -1], img[..., -1]), name  # transparence sans perte
 
 
+def test_version3_files_still_decode():
+    """Un fichier J3K3 (version 3) doit donner exactement ce que donnait le décodeur de la v3."""
+    with open(os.path.join(HERE, "test-images", "v3-sample.j3k"), "rb") as f:
+        data = f.read()
+    assert data[:4] == b"J3K3"
+    assert np.array_equal(j3.decode(data), j3.read_image(os.path.join(HERE, "test-images", "v3-sample.png")))
+
+
 def test_opaque_alpha_is_dropped():
     img = np.dstack([np.full((20, 20, 3), 100, np.uint8), np.full((20, 20), 255, np.uint8)])
     assert j3.decode(j3.encode(img, 4)).shape == (20, 20, 3)
@@ -64,7 +80,7 @@ def test_opaque_alpha_is_dropped():
 def test_bad_files_are_rejected():
     good = j3.encode(np.zeros((8, 8), np.uint8), 4)
     for data, words in [(b"", "pas un fichier"), (b"PNG...." * 4, "pas un fichier"),
-                        (b"J3K2" + good[4:], "autre version"),
+                        (b"J3K2" + good[4:], "autre version"), (b"J3K9" + good[4:], "autre version"),
                         (good[:4] + b"\x00" * 8 + good[12:], "abîmé")]:
         try:
             j3.decode(data)
@@ -106,6 +122,9 @@ def test_javascript_decoder_matches():
         cases["photo"] = photo()
     expected = {}
     with tempfile.TemporaryDirectory() as tmp:
+        import shutil as sh
+        sh.copy(os.path.join(HERE, "test-images", "v3-sample.j3k"), tmp)
+        expected["v3-sample.j3k"] = j3.read_image(os.path.join(HERE, "test-images", "v3-sample.png"))
         for name, img in cases.items():
             for step in (0.3, 4, 30, 400):
                 data = j3.encode(img, step)
@@ -136,6 +155,7 @@ def test_pillow_opens_j3k():
 if __name__ == "__main__":
     test_wavelet_is_invertible()
     test_round_trip()
+    test_version3_files_still_decode()
     test_opaque_alpha_is_dropped()
     test_bad_files_are_rejected()
     test_pillow_opens_j3k()

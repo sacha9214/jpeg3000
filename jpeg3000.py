@@ -5,12 +5,18 @@ Comment ça marche, en 4 étapes :
   1. Couleurs : RGB -> YCbCr (luminosité + 2 couleurs), comme le JPEG.
   2. Transformée en ondelettes CDF 9/7 sur toute l'image (comme JPEG 2000), de n'importe
      quelle taille, au lieu de blocs 8x8 : plus d'effet « pavés » quand on compresse fort.
+     Elle est directionnelle : par bloc de 16x16, elle filtre le long des contours en biais
+     (7 directions choisies par l'encodeur et écrites dans le fichier).
   3. Quantification à zone morte, avec un pas adapté à chaque sous-bande et une
-     zone morte qui dépend du voisinage (on garde la texture, on jette le bruit isolé).
+     zone morte qui dépend du voisinage (on garde la texture, on jette le bruit isolé),
+     puis choix final de chaque valeur en pesant l'erreur contre son coût exact en bits (RDO).
   4. Codage arithmétique adaptatif avec contextes (voisins, coefficient parent, bandes
-     voisines et, pour les couleurs, la luminosité au même endroit). La décision la plus
-     fréquente (« ce coefficient est-il nul ? ») mélange 4 modèles avec un petit réseau
-     qui apprend pendant le codage, comme les compresseurs de la famille PAQ.
+     voisines et, pour les couleurs, la luminosité au même endroit). Les deux décisions les plus
+     fréquentes (« ce coefficient est-il nul ? », « son amplitude dépasse-t-elle 1 ? »)
+     mélangent 4 modèles avec un petit réseau qui apprend pendant le codage, comme les
+     compresseurs de la famille PAQ.
+
+Format J3K4 (version 4). Les fichiers J3K3 (version 3) se lisent toujours.
 
 La transparence (canal alpha) est gardée telle quelle, sans perte.
 
@@ -29,7 +35,8 @@ import time
 
 import numpy as np
 
-MAGIC = b"J3K3"
+MAGIC = b"J3K4"
+OLD_MAGICS = (b"J3K3",)  # versions encore lues (J3K3 = v3, sans ondelette directionnelle)
 # magie, largeur, hauteur, canaux (1 gris, 2 gris+alpha, 3 RGB, 4 RGBA), niveaux, pas, facteur chroma
 HEADER = struct.Struct("<4sIIBBff")
 MAX_PIXELS = 1 << 28
@@ -143,6 +150,139 @@ def idwt2(a, levels):
         t = a[:h, :w].T
         sub = _inv(t[:, :lh], t[:, lh:]).T
         a[:h, :w] = _inv(sub[:, :lw], sub[:, lw:])
+    return a
+
+
+# Ondelette directionnelle (format J3K4) : chaque étape du lifting prédit un échantillon à partir
+# de ses voisins pris le long d'une direction choisie par bloc (un contour en biais reste alors
+# « lisse » et coûte peu), au lieu de toujours prendre les voisins tout droit.
+# OFFS = décalage latéral par échantillon (0 = tout droit, 1 = 45°, 0,5 = interpolé).
+OFFS = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]
+ZERO = OFFS.index(0.0)
+DIR_BLOCK = 16       # côté des blocs de direction (dans la zone du niveau)
+DIR_MIN_GAIN = 0.3   # on ne quitte « tout droit » que si l'énergie restante baisse d'au moins 30 %
+
+
+def _shift0(a, off):
+    """b[i, k] = a[i + off, k] (le long de l'axe 0, interpolation linéaire, bords répétés)."""
+    m = a.shape[0]
+    lo = int(np.floor(off))
+    f = off - lo
+    i0 = np.clip(np.arange(m) + lo, 0, m - 1)
+    if f == 0:
+        return a[i0]
+    i1 = np.clip(np.arange(m) + lo + 1, 0, m - 1)
+    return a[i0] * (1 - f) + a[i1] * f
+
+
+def _sel(a, dm, sign):
+    """Pour chaque échantillon, a décalé de sign * OFFS[direction de cet échantillon]."""
+    if (dm == ZERO).all():
+        return a
+    out = np.empty_like(a)
+    for i, off in enumerate(OFFS):
+        mask = dm == i
+        if mask.any():
+            out[mask] = _shift0(a, sign * off)[mask]
+    return out
+
+
+def _fwd_dir(x, dm):
+    """Comme _fwd (lifting le long du dernier axe), voisins pris selon la direction dm (même forme que x)."""
+    s, d = x[:, 0::2].copy(), x[:, 1::2].copy()
+    nd = d.shape[1]
+    if not nd:
+        return s, d
+    de, do = dm[:, 0::2], dm[:, 1::2]
+    d += ALPHA * (_sel(s[:, :nd], do, -1) + _sel(_sides(s, d)[0], do, 1))
+    _, dp, dc = _sides(s, d)
+    s += BETA * (_sel(dp, de, -1) + _sel(dc, de, 1))
+    d += GAMMA * (_sel(s[:, :nd], do, -1) + _sel(_sides(s, d)[0], do, 1))
+    _, dp, dc = _sides(s, d)
+    s += DELTA * (_sel(dp, de, -1) + _sel(dc, de, 1))
+    return s / K, d * K
+
+
+def _inv_dir(s, d, dm):
+    nd = d.shape[1]
+    if not nd:
+        return s.copy()
+    s = s * K
+    d = d / K
+    de, do = dm[:, 0::2], dm[:, 1::2]
+    _, dp, dc = _sides(s, d)
+    s -= DELTA * (_sel(dp, de, -1) + _sel(dc, de, 1))
+    d -= GAMMA * (_sel(s[:, :nd], do, -1) + _sel(_sides(s, d)[0], do, 1))
+    _, dp, dc = _sides(s, d)
+    s -= BETA * (_sel(dp, de, -1) + _sel(dc, de, 1))
+    d -= ALPHA * (_sel(s[:, :nd], do, -1) + _sel(_sides(s, d)[0], do, 1))
+    x = np.empty((s.shape[0], s.shape[1] + nd))
+    x[:, 0::2] = s
+    x[:, 1::2] = d
+    return x
+
+
+def _grid(m, n):
+    return -(-m // DIR_BLOCK), -(-n // DIR_BLOCK)
+
+
+def _expand(blocks, m, n):
+    return np.repeat(np.repeat(np.asarray(blocks), DIR_BLOCK, 0), DIR_BLOCK, 1)[:m, :n]
+
+
+def _choose(x):
+    """Encodeur : direction de chaque bloc, celle qui prédit le mieux les échantillons impairs."""
+    m, n = x.shape
+    nbm, nbn = _grid(m, n)
+    s, d = x[:, 0::2], x[:, 1::2]
+    nd = d.shape[1]
+    if not nd:
+        return np.full((nbm, nbn), ZERO, dtype=np.int64)
+    sn = _sides(s, d)[0]
+    costs = np.zeros((len(OFFS), nbm, nbn))
+    full = np.zeros((nbm * DIR_BLOCK, nbn * DIR_BLOCK))
+    for i, off in enumerate(OFFS):
+        full[:m, 1:n:2] = np.abs(d - 0.5 * (_shift0(s[:, :nd], -off) + _shift0(sn, off)))
+        costs[i] = full.reshape(nbm, DIR_BLOCK, nbn, DIR_BLOCK).sum(axis=(1, 3))
+    best = costs.argmin(axis=0)
+    best[costs[ZERO] <= costs.min(axis=0) * (1 + DIR_MIN_GAIN)] = ZERO
+    return best
+
+
+def dir_shapes(h, w, levels):
+    """Taille des grilles de directions : pour chaque niveau, passe verticale puis horizontale."""
+    shapes = []
+    for hh, ww in level_sizes(h, w, levels)[:-1]:
+        shapes += [_grid(ww, hh), _grid(hh, ww)]
+    return shapes
+
+
+def dwt2_dir(img, levels, dirs=None):
+    """Ondelette directionnelle. dirs = None : l'encodeur choisit les directions (renvoyées)."""
+    a = img.astype(np.float64)
+    out = []
+    for li, (h, w) in enumerate(level_sizes(*a.shape, levels)[:-1]):
+        t = a[:h, :w].T                                   # passe verticale (le long des colonnes)
+        vb = dirs[2 * li] if dirs is not None else _choose(t)
+        lo, hi = _fwd_dir(t, _expand(vb, w, h))
+        v = np.concatenate([lo, hi], axis=1).T
+        hb = dirs[2 * li + 1] if dirs is not None else _choose(v)  # passe horizontale
+        lo, hi = _fwd_dir(v, _expand(hb, h, w))
+        a[:h, :w] = np.concatenate([lo, hi], axis=1)
+        out += [vb, hb]
+    return a, out
+
+
+def idwt2_dir(a, levels, dirs):
+    a = a.copy()
+    sizes = level_sizes(*a.shape, levels)
+    for lev in range(levels, 0, -1):
+        (h, w), (lh, lw) = sizes[lev - 1], sizes[lev]
+        vb, hb = dirs[2 * (lev - 1)], dirs[2 * (lev - 1) + 1]
+        z = a[:h, :w]
+        v = _inv_dir(z[:, :lw], z[:, lw:], _expand(hb, h, w))
+        t = v.T
+        a[:h, :w] = _inv_dir(t[:, :lh], t[:, lh:], _expand(vb, w, h)).T
     return a
 
 
@@ -394,6 +534,16 @@ for _d in range(-2047, 2048):
     for _p in range(_lo, SQUASH[_d + 2047] + 1):
         STRETCH[_p] = _d
     _lo = max(_lo, SQUASH[_d + 2047] + 1)
+COST = [32.0] + [-np.log2(p / 4096.0) for p in range(1, 4096)] + [0.0]  # bits pour une probabilité 12 bits
+RDO_LAMBDA = 0.08  # poids du débit dans la quantification RDO (0 = désactivée)
+LEVEL1_STEP = 1.1  # J3K4 : détails les plus fins quantifiés 10 % plus grossièrement (mesuré : un peu mieux)
+
+
+def _band_step(st, norm, lev, o, v4=True):
+    """Pas de quantification d'une sous-bande."""
+    if o != LL and lev == 1 and v4:
+        return st * LEVEL1_STEP / norm
+    return st / norm
 MIX_W0 = 19660   # poids de départ de chaque modèle dans le mélange (0,3 en virgule fixe 16 bits)
 MIX_SHIFT = 11   # vitesse d'apprentissage du mélangeur (plus grand = plus lent)
 
@@ -424,6 +574,12 @@ class _BandModel:
         self.smb = [32768] * 162
         self.smc = [32768] * 108
         self.mw = [MIX_W0, MIX_W0, MIX_W0, MIX_W0, 0] * 8
+        # « Amplitude > 1 ? » : même principe.
+        self.gfa = [32768] * 20
+        self.gsa = [32768] * 20
+        self.gmb = [32768] * 384
+        self.gmc = [32768] * 108
+        self.gw = [MIX_W0, MIX_W0, MIX_W0, MIX_W0, 0] * 10
 
 
 class _Models:
@@ -466,17 +622,47 @@ def _block_any(m, h, w):
     return p.reshape(nbh, BLOCK, nbw, BLOCK).any(axis=(1, 3)).astype(np.int64).tolist()
 
 
-def _code_band(rc, model, q, R, P, C, X, h, w):
+def _ue_cost(probs, base, v):
+    """Coût en bits de ue(v) avec l'état actuel des probabilités (encodeur seulement)."""
+    v += 1
+    n = v.bit_length() - 1
+    c = float(n)
+    for i in range(n):
+        j = 2 * (base + (i if i < 19 else 19))
+        c += COST[4096 - ((probs[j] + probs[j + 1]) >> 5)]
+    j = 2 * (base + (n if n < 19 else 19))
+    return c + COST[(probs[j] + probs[j + 1]) >> 5]
+
+
+def _code_band(rc, model, q, R, P, C, X, h, w, A=None, lam=0.0, v4=True):
     """Bande haute fréquence. Contextes déjà connus du décodeur avant de la coder :
     P = bande « parente » (même orientation, échelle 2 fois plus grossière),
     C = bandes « cousines » (même échelle, orientations déjà codées),
-    X = même bande de la luminosité (pour les couleurs ; None pour la luminosité)."""
+    X = même bande de la luminosité (pour les couleurs ; None pour la luminosité).
+    Encodeur : A = amplitudes exactes (en pas de quantification) ; si lam > 0, chaque valeur
+    est choisie en pesant l'erreur contre le coût exact en bits (quantification « RDO »)."""
     if not h or not w:
         return
     enc = q is not None
+    rdo = enc and lam > 0 and A is not None
+
+    def qrow_sign(y, x):
+        return A[y][x] < 0
     bit, code, ue = rc.bit, rc.code, rc.ue
     blk, gt1, gt2, eg, sgn = model.blk, model.gt1, model.gt2, model.eg, model.sgn
     sfa, ssa, smb, smc, mw = model.sfa, model.ssa, model.smb, model.smc, model.mw
+    gfa, gsa, gmb, gmc, gw = model.gfa, model.gsa, model.gmb, model.gmc, model.gw
+    g1mix = v4  # J3K3 : « amplitude > 1 » codé sans mélange
+
+    def g1pred(mc, l1, u1, dg, fr, cmx, xmx, p, lc):
+        """Probabilité mélangée de « amplitude > 1 » (et ce qu'il faut pour mettre à jour)."""
+        ga = mc
+        gb = ((((l1 if l1 < 3 else 3) * 4 + (u1 if u1 < 3 else 3)) * 4 + (dg if dg < 3 else 3)) * 3 + p) * 2 + lc
+        gc = (((fr if fr < 3 else 3) * 3 + cmx) * 3 + xmx) * 3 + p
+        t0, t1, t2, t3 = ST[gfa[ga] >> 4], ST[gsa[ga] >> 4], ST[gmb[gb] >> 4], ST[gmc[gc] >> 4]
+        kg = 5 * (mc >> 1)
+        dot = (gw[kg] * t0 + gw[kg + 1] * t1 + gw[kg + 2] * t2 + gw[kg + 3] * t3 + gw[kg + 4] * 256) >> 16
+        return ga, gb, gc, SQ[(dot if dot < 2047 else 2047) + 2047] if dot > -2047 else 1, t0, t1, t2, t3, kg
     ST, SQ, SH = STRETCH, SQUASH, MIX_SHIFT
     Q = q.tolist() if enc else None
     zero = np.zeros((h, w), dtype=np.int64)
@@ -514,6 +700,7 @@ def _code_band(rc, model, q, R, P, C, X, h, w):
                 pmr, cmr, xmr = pm[y], cm[y], xm[y]
                 xsr = xs[y] if xs is not None else None
                 qrow = Q[y] if enc else None
+                arow = A[y] if rdo else None
                 for x in range(x0, x1):
                     l1 = abs(row[x - 1]) if x else 0
                     u1 = dg = 0
@@ -540,6 +727,46 @@ def _code_band(rc, model, q, R, P, C, X, h, w):
                     k = 5 * sb
                     dot = (mw[k] * s0 + mw[k + 1] * s1 + mw[k + 2] * s2 + mw[k + 3] * s3 + mw[k + 4] * 256) >> 16
                     p1 = SQ[(dot if dot < 2047 else 2047) + 2047] if dot > -2047 else 1
+                    g1p = -1
+                    if rdo:
+                        av = arow[x]
+                        av = -av if av < 0 else av
+                        kmax = int(av - BIAS + 0.5)
+                        if kmax >= 1 or m:
+                            kmax = kmax if kmax >= 1 else 1
+                            neg = v < 0 if v else qrow_sign(y, x)
+                            # Coût de chaque choix : 0, kmax-1 ou kmax, avec les probabilités actuelles.
+                            mc = sn + 2 * p
+                            mc = 2 * MLOG[mc if mc < 64 else 63] + lc
+                            sl = row[x - 1] if x else 0
+                            su = up[x] if up is not None else 0
+                            sc = 3 * ((sl > 0) - (sl < 0) + 1) + (su > 0) - (su < 0) + 1
+                            if xsr is not None:
+                                sc = 3 * sc + xsr[x]
+                            ps0 = (sgn[2 * sc] + sgn[2 * sc + 1]) >> 5
+                            if g1mix:
+                                ga, gb, gc, g1p, t0, t1, t2, t3, kg = g1pred(mc, l1, u1, dg, fr, cmr[x], xmr[x], p, lc)
+                                g1 = 4096 - g1p
+                            else:
+                                g1 = (gt1[2 * mc] + gt1[2 * mc + 1]) >> 5
+                            g2 = (gt2[2 * mc] + gt2[2 * mc + 1]) >> 5
+                            base = COST[p1] + COST[4096 - ps0 if neg else ps0]
+                            best_k, best_j = 0, av * av + lam * COST[4096 - p1]
+                            for kk in (kmax - 1, kmax):
+                                if kk < 1:
+                                    continue
+                                if kk == 1:
+                                    bits = base + COST[g1]
+                                elif kk == 2:
+                                    bits = base + COST[4096 - g1] + COST[g2]
+                                else:
+                                    bits = base + COST[4096 - g1] + COST[4096 - g2] + _ue_cost(eg, 20 * mc, kk - 3)
+                                e = av - kk - BIAS
+                                jj = e * e + lam * bits
+                                if jj < best_j:
+                                    best_k, best_j = kk, jj
+                            m = best_k
+                            v = -m if neg else m
                     b = code(4096 - p1, 1 if m else 0)
                     err = (b << 12) - p1
                     mw[k] += (s0 * err) >> SH
@@ -560,7 +787,30 @@ def _code_band(rc, model, q, R, P, C, X, h, w):
                     # Amplitude : 1, 2, puis Exp-Golomb, selon l'activité autour.
                     mc = sn + 2 * p
                     mc = 2 * MLOG[mc if mc < 64 else 63] + lc
-                    if bit(gt1, mc, m > 1):
+                    if g1mix:
+                        if g1p < 0:
+                            ga, gb, gc, g1p, t0, t1, t2, t3, kg = g1pred(mc, l1, u1, dg, fr, cmr[x], xmr[x], p, lc)
+                        qa, qs, qb_, qc_ = gfa[ga], gsa[ga], gmb[gb], gmc[gc]
+                        gb1 = code(4096 - g1p, 1 if m > 1 else 0)
+                        err = (gb1 << 12) - g1p
+                        gw[kg] += (t0 * err) >> SH
+                        gw[kg + 1] += (t1 * err) >> SH
+                        gw[kg + 2] += (t2 * err) >> SH
+                        gw[kg + 3] += (t3 * err) >> SH
+                        gw[kg + 4] += (256 * err) >> SH
+                        if gb1:
+                            gfa[ga] = qa + ((65536 - qa) >> 4)
+                            gsa[ga] = qs + ((65536 - qs) >> 7)
+                            gmb[gb] = qb_ + ((65536 - qb_) >> 5)
+                            gmc[gc] = qc_ + ((65536 - qc_) >> 5)
+                        else:
+                            gfa[ga] = qa - (qa >> 4)
+                            gsa[ga] = qs - (qs >> 7)
+                            gmb[gb] = qb_ - (qb_ >> 5)
+                            gmc[gc] = qc_ - (qc_ >> 5)
+                    else:
+                        gb1 = bit(gt1, mc, m > 1)
+                    if gb1:
                         if bit(gt2, mc, m > 2):
                             m = 3 + ue(eg, 20 * mc, m - 3)
                         else:
@@ -576,7 +826,7 @@ def _code_band(rc, model, q, R, P, C, X, h, w):
                     row[x] = -m if bit(sgn, sc, v < 0) else m
 
 
-def _code_planes(rc, ncolor, h, w, levels, qbands=None):
+def _code_planes(rc, ncolor, h, w, levels, qbands=None, amps=None, lam=0.0, v4=True):
     specs = band_specs(h, w, levels)
     luma, chroma = _Models(), _Models()
     out = []
@@ -594,10 +844,36 @@ def _code_planes(rc, ncolor, h, w, levels, qbands=None):
                 model = models.bands[2 * (min(lev, 4) - 1) + (o == HH)]
                 X = out[0][bi] if ci else None
                 C = [bands[bi - k] for k in range(1, o)]
-                _code_band(rc, model, q, R, parents.get(o), C, X, bh, bw)
+                A = amps[ci][bi] if amps is not None else None
+                _code_band(rc, model, q, R, parents.get(o), C, X, bh, bw, A, lam, v4)
                 parents[o] = R
             bands.append(R)
         out.append(bands)
+    return out
+
+
+def _code_dirs(rc, shapes, dirs=None):
+    """Directions de l'ondelette : un symbole par bloc, en 3 bits adaptatifs (arbre binaire),
+    selon la direction du bloc précédent et le type de passe (verticale ou horizontale)."""
+    enc = dirs is not None
+    probs = _probs(2 * len(OFFS) * 8)
+    out = []
+    for gi, (nr, nc) in enumerate(shapes):
+        g = dirs[gi].tolist() if enc else [[0] * nc for _ in range(nr)]
+        prev = ZERO
+        for r in range(nr):
+            row = g[r]
+            for c in range(nc):
+                base = ((gi & 1) * len(OFFS) + prev) * 8
+                sym = row[c] if enc else 0
+                node = 1
+                for i in (2, 1, 0):
+                    node = 2 * node + rc.bit(probs, base + node, (sym >> i) & 1)
+                sym = node - 8
+                if sym >= len(OFFS):
+                    raise ValueError("fichier .j3k abîmé (direction impossible)")
+                row[c] = prev = sym
+        out.append(np.array(g, dtype=np.int64).reshape(nr, nc))
     return out
 
 
@@ -630,37 +906,44 @@ def prepare(img):
         alpha = None  # entièrement opaque : inutile de garder la transparence
     levels = _levels_for(h, w)
     planes = [color[..., 0].astype(np.float64) - 128.0] if color.shape[2] == 1 else rgb_to_ycc(color)
-    coeffs = [dwt2(p, levels) for p in planes]
-    return {"h": h, "w": w, "levels": levels, "coeffs": coeffs, "alpha": alpha}
+    luma, dirs = dwt2_dir(planes[0], levels)       # directions choisies sur la luminosité...
+    coeffs = [luma] + [dwt2_dir(p, levels, dirs)[0] for p in planes[1:]]  # ... et reprises pour les couleurs
+    return {"h": h, "w": w, "levels": levels, "coeffs": coeffs, "alpha": alpha, "dirs": dirs}
 
 
-def _quantize_all(prep, step, chroma):
+def _quantize_all(prep, step, chroma, amps=None):
+    """Quantification de départ ; amps (liste) reçoit les coefficients exacts en pas de quantification."""
     specs = band_specs(prep["h"], prep["w"], prep["levels"])
     out = []
     for ci, a in enumerate(prep["coeffs"]):
         st = step * (chroma if ci else 1.0)
-        bands, parents = [], {}
-        for _, o, ys, xs, norm in specs:
+        bands, parents, exact = [], {}, []
+        for lev, o, ys, xs, norm in specs:
             if o == LL:
                 q = np.round(a[ys, xs] / (st / norm)).astype(np.int64)
+                exact.append(None)
             else:
-                q = _quantize_detail(a[ys, xs], st / norm, parents.get(o))
+                sb_ = _band_step(st, norm, lev, o)
+                q = _quantize_detail(a[ys, xs], sb_, parents.get(o))
                 parents[o] = q
+                exact.append((a[ys, xs] / sb_).tolist() if amps is not None else None)
             bands.append(q)
         out.append(bands)
+        if amps is not None:
+            amps.append(exact)
     return out
 
 
-def _reconstruct(qbands, h, w, levels, step, chroma, alpha=None):
+def _reconstruct(qbands, h, w, levels, step, chroma, alpha=None, dirs=None, v4=True):
     specs = band_specs(h, w, levels)
     planes = []
     for ci, bands in enumerate(qbands):
         st = step * (chroma if ci else 1.0)
         a = np.zeros((h, w))
-        for (_, o, ys, xs, norm), q in zip(specs, bands):
+        for (lev, o, ys, xs, norm), q in zip(specs, bands):
             q = np.asarray(q, dtype=np.float64).reshape(ys.stop - ys.start, xs.stop - xs.start)
-            a[ys, xs] = _dequantize(q, st / norm, o == LL)
-        planes.append(idwt2(a, levels))
+            a[ys, xs] = _dequantize(q, _band_step(st, norm, lev, o, v4), o == LL)
+        planes.append(idwt2_dir(a, levels, dirs) if dirs is not None else idwt2(a, levels))
     if len(planes) == 1:
         img = np.clip(np.round(planes[0] + 128.0), 0, 255).astype(np.uint8)
     else:
@@ -683,30 +966,40 @@ def _f32(x):
     return float(np.float32(x))
 
 
-def simulate(img_or_prep, step):
-    """Image telle qu'elle sera après décodage, sans fabriquer le fichier (rapide)."""
-    prep = img_or_prep if isinstance(img_or_prep, dict) else prepare(img_or_prep)
-    step, chroma = _f32(step), _f32(CHROMA)
-    q = _quantize_all(prep, step, chroma)
-    return _reconstruct(q, prep["h"], prep["w"], prep["levels"], step, chroma, prep["alpha"])
-
-
-def encode(img_or_prep, step):
-    """Image (uint8 : gris, gris+alpha, RGB ou RGBA) -> octets .j3k."""
+def encode_full(img_or_prep, step):
+    """Image -> (octets .j3k, image telle qu'elle sera décodée)."""
     prep = img_or_prep if isinstance(img_or_prep, dict) else prepare(img_or_prep)
     step, chroma = _f32(step), _f32(CHROMA)
     if not (step > 0 and np.isfinite(step)):
         raise ValueError("pas de quantification invalide : {}".format(step))
-    q = _quantize_all(prep, step, chroma)
+    amps = [] if RDO_LAMBDA > 0 else None
+    q = _quantize_all(prep, step, chroma, amps)
     rc = Encoder()
-    _code_planes(rc, len(q), prep["h"], prep["w"], prep["levels"], q)
+    _code_dirs(rc, dir_shapes(prep["h"], prep["w"], prep["levels"]), prep["dirs"])
+    bands = _code_planes(rc, len(q), prep["h"], prep["w"], prep["levels"], q, amps, RDO_LAMBDA)
     alpha = prep["alpha"]
     if alpha is not None:
         _code_ll(rc, _probs(60), alpha.astype(np.int64).tolist(), [[0] * prep["w"] for _ in range(prep["h"])],
                  prep["h"], prep["w"])
     nch = len(q) + (alpha is not None)
     header = HEADER.pack(MAGIC, prep["w"], prep["h"], nch, prep["levels"], step, chroma)
-    return header + rc.finish()
+    image = _reconstruct(bands, prep["h"], prep["w"], prep["levels"], step, chroma, alpha, prep["dirs"])
+    return header + rc.finish(), image
+
+
+def encode(img_or_prep, step):
+    """Image (uint8 : gris, gris+alpha, RGB ou RGBA) -> octets .j3k."""
+    return encode_full(img_or_prep, step)[0]
+
+
+def simulate(img_or_prep, step):
+    """Image telle qu'elle sera après décodage (sans quantification RDO : rapide, sans coder)."""
+    prep = img_or_prep if isinstance(img_or_prep, dict) else prepare(img_or_prep)
+    if RDO_LAMBDA > 0:
+        return encode_full(prep, step)[1]
+    step, chroma = _f32(step), _f32(CHROMA)
+    q = _quantize_all(prep, step, chroma)
+    return _reconstruct(q, prep["h"], prep["w"], prep["levels"], step, chroma, prep["alpha"], prep["dirs"])
 
 
 def encode_to_size(img_or_prep, max_bytes, iterations=12):
@@ -726,7 +1019,7 @@ def encode_to_size(img_or_prep, max_bytes, iterations=12):
 
 def read_header(data):
     """En-tête d'un .j3k -> dict (largeur, hauteur, canaux, niveaux, pas, chroma)."""
-    if len(data) < HEADER.size or data[:4] != MAGIC:
+    if len(data) < HEADER.size or (data[:4] != MAGIC and data[:4] not in OLD_MAGICS):
         if data[:3] == b"J3K" and len(data) >= 4:
             raise ValueError("fichier JPEG 3000 d'une autre version ({}) : ce décodeur lit {}".format(
                 data[:4].decode("ascii", "replace"), MAGIC.decode()))
@@ -735,7 +1028,8 @@ def read_header(data):
     if not (1 <= nch <= 4 and 1 <= levels <= 8 and w and h and w * h <= MAX_PIXELS
             and step > 0 and np.isfinite(step) and chroma > 0 and np.isfinite(chroma)):
         raise ValueError("fichier .j3k abîmé (en-tête incohérent)")
-    return {"width": w, "height": h, "channels": nch, "levels": levels, "step": step, "chroma": chroma}
+    return {"width": w, "height": h, "channels": nch, "levels": levels, "step": step, "chroma": chroma,
+            "version": data[:4].decode()}
 
 
 def decode(data):
@@ -743,14 +1037,16 @@ def decode(data):
     hd = read_header(data)
     w, h, nch = hd["width"], hd["height"], hd["channels"]
     ncolor = 1 if nch <= 2 else 3
+    v4 = hd["version"] == MAGIC.decode()
     rc = Decoder(data, HEADER.size)
-    bands = _code_planes(rc, ncolor, h, w, hd["levels"])
+    dirs = _code_dirs(rc, dir_shapes(h, w, hd["levels"])) if v4 else None
+    bands = _code_planes(rc, ncolor, h, w, hd["levels"], v4=v4)
     alpha = None
     if nch in (2, 4):
         alpha = [[0] * w for _ in range(h)]
         _code_ll(rc, _probs(60), None, alpha, h, w)
         alpha = np.clip(np.array(alpha, dtype=np.int64), 0, 255)
-    return _reconstruct(bands, h, w, hd["levels"], hd["step"], hd["chroma"], alpha)
+    return _reconstruct(bands, h, w, hd["levels"], hd["step"], hd["chroma"], alpha, dirs, v4)
 
 
 # ---------------------------------------------------------------------------
@@ -922,7 +1218,7 @@ def main(argv=None):
             raise SystemExit("{} : {}".format(args.entree, err))
         kind = ("gris", "gris + transparence", "couleur", "couleur + transparence")[hd["channels"] - 1]
         print("{} : JPEG 3000 ({}), {}x{}, {}, qualité {:.0f}, {} octets ({:.2f} bit/pixel)".format(
-            args.entree, MAGIC.decode(), hd["width"], hd["height"], kind, step_to_quality(hd["step"]),
+            args.entree, hd["version"], hd["width"], hd["height"], kind, step_to_quality(hd["step"]),
             _n(len(data)), 8 * len(data) / (hd["width"] * hd["height"])))
     else:
         ap.print_help()

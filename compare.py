@@ -142,7 +142,7 @@ def size_for(codec, img, metric, target, lo, hi):
 def j3k_for(prep, img, metric, target):
     """Taille du plus petit fichier JPEG 3000 qui atteint la qualité visée (réellement décodé)."""
     lo, hi = -2.0, 11.0  # log2 du pas
-    for _ in range(20):
+    for _ in range(15):
         mid = (lo + hi) / 2
         if metric(img, j3.simulate(prep, 2 ** mid)) >= target:
             lo = mid
@@ -207,7 +207,7 @@ def benchmark(photos, codecs):
         return pct(np.mean(values)) if values else "—"
 
     labels = {"JPEG 2000": "JPEG 2000 (2000)", "WebP": "WebP (2010)", "AVIF": "AVIF (2019)",
-              "JPEG 3000": "**JPEG 3000 v3 (this prototype)**"}
+              "JPEG 3000": "**JPEG 3000 v4 (this prototype)**"}
     summary = [
         "# JPEG 3000 vs JPEG, JPEG 2000, WebP and AVIF: results",
         "",
