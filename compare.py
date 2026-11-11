@@ -207,7 +207,7 @@ def benchmark(photos, codecs):
         return pct(np.mean(values)) if values else "—"
 
     labels = {"JPEG 2000": "JPEG 2000 (2000)", "WebP": "WebP (2010)", "AVIF": "AVIF (2019)",
-              "JPEG 3000": "**JPEG 3000 v4.1 (this prototype)**"}
+              "JPEG 3000": "**JPEG 3000 v5 (this prototype)**"}
     summary = [
         "# JPEG 3000 vs JPEG, JPEG 2000, WebP and AVIF: results",
         "",

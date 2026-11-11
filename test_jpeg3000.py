@@ -64,12 +64,30 @@ def test_round_trip():
                 assert np.array_equal(out[..., -1], img[..., -1]), name  # transparence sans perte
 
 
-def test_version3_files_still_decode():
-    """Un fichier J3K3 (version 3) doit donner exactement ce que donnait le décodeur de la v3."""
-    with open(os.path.join(HERE, "test-images", "v3-sample.j3k"), "rb") as f:
-        data = f.read()
-    assert data[:4] == b"J3K3"
-    assert np.array_equal(j3.decode(data), j3.read_image(os.path.join(HERE, "test-images", "v3-sample.png")))
+OLD_SAMPLES = (("v3-sample", b"J3K3"), ("v4-sample", b"J3K4"))
+
+
+def test_old_versions_still_decode():
+    """Un fichier J3K3 ou J3K4 doit donner exactement ce que donnait le décodeur de sa version."""
+    for name, magic in OLD_SAMPLES:
+        with open(os.path.join(HERE, "test-images", name + ".j3k"), "rb") as f:
+            data = f.read()
+        assert data[:4] == magic, name
+        assert np.array_equal(j3.decode(data), j3.read_image(os.path.join(HERE, "test-images", name + ".png"))), name
+
+
+def test_starting_probabilities_are_used():
+    """La table PRIORS (probabilités de départ apprises) doit se relire en entier et servir."""
+    assert j3._priors() is not None
+    img = photo() if photo() is not None else (np.random.RandomState(3).rand(64, 64, 3) * 255).astype(np.uint8)
+    learned = len(j3.encode(img, 30))
+    table, j3.PRIORS = j3.PRIORS, ""  # sans la table : tout repart de 50 %
+    try:
+        flat = len(j3.encode(img, 30))
+    finally:
+        j3.PRIORS = table
+    if photo() is not None:
+        assert learned < flat, (learned, flat)  # la table doit faire gagner des octets
 
 
 def test_opaque_alpha_is_dropped():
@@ -122,9 +140,9 @@ def test_javascript_decoder_matches():
         cases["photo"] = photo()
     expected = {}
     with tempfile.TemporaryDirectory() as tmp:
-        import shutil as sh
-        sh.copy(os.path.join(HERE, "test-images", "v3-sample.j3k"), tmp)
-        expected["v3-sample.j3k"] = j3.read_image(os.path.join(HERE, "test-images", "v3-sample.png"))
+        for old, _ in OLD_SAMPLES:
+            shutil.copy(os.path.join(HERE, "test-images", old + ".j3k"), tmp)
+            expected[old + ".j3k"] = j3.read_image(os.path.join(HERE, "test-images", old + ".png"))
         for name, img in cases.items():
             for step in (0.3, 4, 30, 400):
                 data = j3.encode(img, step)
@@ -155,7 +173,8 @@ def test_pillow_opens_j3k():
 if __name__ == "__main__":
     test_wavelet_is_invertible()
     test_round_trip()
-    test_version3_files_still_decode()
+    test_old_versions_still_decode()
+    test_starting_probabilities_are_used()
     test_opaque_alpha_is_dropped()
     test_bad_files_are_rejected()
     test_pillow_opens_j3k()

@@ -3,5 +3,6 @@ __pycache__/
 *.j3k
 !web/astronaut.j3k
 !test-images/v3-sample.j3k
+!test-images/v4-sample.j3k
 .venv/
 .claude/
