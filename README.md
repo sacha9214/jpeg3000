@@ -1,10 +1,11 @@
 # JPEG 3000 (prototype)
 
 An experimental image format (`.j3k`) that makes files much smaller than JPEG at the same
-image quality, without JPEG's blocky artifacts at high compression. Version 4 adds a
-directional wavelet transform and rate-distortion optimized quantization to get closer to AVIF
-(version 4.1 tunes the encoder further, same file format); version 3 added an in-browser
-decoder, transparency and support for images of any size.
+image quality, without JPEG's blocky artifacts at high compression. Version 5 starts the
+entropy coder from probabilities learned on other photos and adds trellis ("dependent")
+quantization: on photos it was never tuned on, it now matches AVIF at equal PSNR. Version 4
+added a directional wavelet transform; version 3 an in-browser decoder, transparency and
+support for images of any size.
 
 ![Same file size, zoomed in: original, JPEG, JPEG 2000, WebP, AVIF, JPEG 3000](comparaison.png)
 
@@ -24,18 +25,19 @@ Average file size relative to JPEG, at equal image quality
 | WebP (2010) | −35 % | −26 % |
 | AVIF (2019) | −55 % | −46 % |
 | JPEG 3000 v3 | −49 % | −34 % |
-| JPEG 3000 v4 | −52 % | −38 % |
-| **JPEG 3000 v4.1** | **−52 %** | **−38 %** |
+| JPEG 3000 v4.1 | −52 % | −38 % |
+| **JPEG 3000 v5** | **−53 %** | **−40 %** |
 
 - **PSNR**: pixel-by-pixel fidelity. **SSIM**: perceived similarity, closer to what the eye sees.
-- Against its predecessor JPEG 2000 (OpenJPEG, 9/7 wavelet): files **16 % smaller** at equal PSNR
-  and **21 % smaller** at equal SSIM, smaller on all 20 measurements.
-- Against WebP: smaller on all 20 measurements in PSNR, on 17 out of 20 in SSIM (3 ties).
-- **AVIF is still better on average**, but the gap was roughly halved: its files are about 6 %
-  smaller than JPEG 3000's at equal PSNR (11 % for version 3) and 12 % smaller at equal SSIM
-  (18 % for version 3). JPEG 3000 v4.1 produces smaller files than AVIF in 7 measurements out of
-  20 in PSNR (the cat photo at every level, and 3 photos out of 4 at the highest quality), and
-  in 4 out of 20 in SSIM (plus 1 tie).
+- Against its predecessor JPEG 2000 (OpenJPEG, 9/7 wavelet): files **18 % smaller** at equal PSNR
+  and **23 % smaller** at equal SSIM, smaller on all 20 measurements.
+- Against WebP: smaller on all 20 measurements, in PSNR and in SSIM.
+- **AVIF is still better on these 4 photos**, but the gap keeps shrinking: its files are about
+  3 % smaller than JPEG 3000's at equal PSNR (6 % for version 4.1, 11 % for version 3) and 9 %
+  smaller at equal SSIM (12 % for version 4.1, 18 % for version 3). JPEG 3000 v5 produces
+  smaller files than AVIF in 7 measurements out of 20 in PSNR (the cat photo at every level, the
+  astronaut and the coffee cup at the highest quality; plus 1 tie), and in 5 out of 20 in SSIM
+  (the cat photo at every level).
 
 How JPEG 3000 compares with AVIF, in more detail (Bjøntegaard delta rate, AVIF as the
 reference, + means JPEG 3000 needs more bytes):
@@ -44,26 +46,38 @@ reference, + means JPEG 3000 needs more bytes):
 |---|---|---:|---:|
 | 5 tuning photos (the 4 test photos + scikit-image's motorcycle) | v3 | +8.9 % | +21.6 % |
 | | v4 | +3.2 % | +14.7 % |
-| | **v4.1** | **+2.9 %** | **+13.5 %** |
+| | v4.1 | +2.9 % | +13.5 % |
+| | **v5** | **+0.5 %** | **+9.5 %** |
 | 9 photos never used for tuning | v3 | +6.4 % | +19.1 % |
 | | v4 | +1.8 % | +12.7 % |
-| | **v4.1** | **+1.7 %** | **+11.5 %** |
+| | v4.1 | +1.7 % | +11.5 % |
+| | **v5** | **−0.6 %** | **+7.8 %** |
+
+Version 5's starting probabilities were learned on a third set of 39 small pictures that
+contains none of the photos above.
 
 Correction: the version 4 README gave +4.0 % / +15.7 % for the photos never used for tuning.
 One of them, scikit-image's `coins`, turned out to hide an old JPEG 8x8 grid: AVIF gains 1.5 dB
 on it when the grid is aligned and loses that gain once the picture is shifted by 1 to 4 pixels.
 It is now measured shifted by 3 pixels, which gives the numbers above.
 
-- The gap depends on the bitrate. JPEG 3000 is at its best at high quality (on the astronaut it
-  needs 14 % fewer bytes than AVIF at 37.8 dB) and at its worst at low bitrates: below about
-  0.4 bit/pixel, AVIF needs 20 to 26 % fewer bytes on the astronaut and grayscale photos. That's
-  where AV1's block prediction and deringing filters shine.
-- It beats AVIF in PSNR on about half of the photos (a cat, a landscape at −24 %, gravel, a
-  microscope slide...) and loses clearly on pictures with large flat or black areas or fine
-  noise (Hubble deep field +23 %, retina +19 %, coins +9 %).
-- The SSIM gap is larger partly because AVIF is tuned for perception: libavif's default output
-  differs from both `tune=psnr` and `tune=ssim` (recent versions likely use libaom's perceptual
-  `tune=iq`). JPEG 3000 is tuned for PSNR.
+- On the 9 photos never used for tuning, version 5 needs on average slightly **fewer** bytes
+  than AVIF at equal PSNR (−0.6 %): the first version to get there. It is still behind at
+  equal SSIM.
+- The gap depends on the bitrate. JPEG 3000 is at its best at high quality and at its worst at
+  low bitrates: below about 0.4 bit/pixel AVIF stays clearly ahead on the astronaut and
+  grayscale photos (it needed 20 to 26 % fewer bytes than version 4.1 there). That's where
+  AV1's block prediction and deringing filters shine.
+- It beats AVIF in PSNR on 7 of the 14 photos (a cat −8 %, a landscape −26 %, a rocket −10 %,
+  gravel, a microscope slide, coffee...) and loses clearly on pictures with large flat or black
+  areas or fine noise (Hubble deep field +23 %, retina +18 %, coins +6 %).
+- The SSIM gap is larger for two measured reasons. AVIF stores colours at half resolution
+  (4:2:0) and spends the saved bytes on brightness, which is all this SSIM looks at: on the
+  astronaut and motorcycle photos, at equal file size, version 4.1's brightness error was 20 to
+  35 % higher than AVIF's while its colour error was equal or lower. And at low bitrates AV1's
+  block prediction simply codes brightness better (it keeps about half a dB on the grayscale
+  photo). Shifting bits from colours to brightness, or quantizing flat areas more finely like
+  AVIF's perceptual tuning does, was measured: both only trade PSNR for SSIM.
 
 To read these numbers honestly:
 
@@ -71,6 +85,33 @@ To read these numbers honestly:
 - JPEG XL, the other modern format, could not be tested here.
 - These numbers can't be compared with version 2's: version 2 was measured on Windows
   wallpapers, against a weaker JPEG 2000 encoder (Jasper, 5/3 wavelet) and without AVIF.
+
+## What's new in version 5
+
+Format `J3K5`: files are **2.5 % smaller at equal PSNR and 3.5 % smaller at equal SSIM** than
+version 4.1 (Bjøntegaard delta rate over the 5 tuning photos; every photo improves, and small
+files gain the most). Version 4 and version 3 files (`J3K4`, `J3K3`) can still be read, in
+Python and in the browser.
+
+| Change | Gain |
+|---|---:|
+| **Learned starting probabilities.** Earlier versions started every file with all probabilities at 50 % and paid to learn them again each time. Version 5 starts its 35 000 contexts, the mixer weights and the wavelet-direction coder from values learned on other photos, stored as a 17 KB table that is part of the format (the same idea as AV1's default probability tables). Rebuild it with `tools/train_priors.py` | −1.4 % PSNR, −1.3 % SSIM (−3 to −7 % on files under 5 KB) |
+| **Trellis ("dependent") quantization**, the technique VVC uses. Each value is rebuilt from one of two interleaved grids, picked by a 4-state machine that follows the parity of the previous values; the two grids together are twice as fine as either. The encoder searches each row of a block with a Viterbi trellis that weighs the error against the exact cost in bits. It replaces version 4's dead-zone quantizer | −1 % PSNR, −2.7 % SSIM, mostly above 0.7 bit/pixel (+0.1 to +0.2 dB) |
+| Reconstruction point of each value moved slightly outward | small gain on both metrics |
+
+Measured and rejected:
+
+- Quantization adapted to each 32×32 zone (finer in flat areas, like AVIF's perceptual tuning):
+  it only trades PSNR for SSIM (strength 0.5: +2.7 points of PSNR gap for −1.8 points of SSIM
+  gap on the photos never used for tuning).
+- Coarser quantization of the finest colour details (a soft 4:2:0), or a higher colour factor:
+  the same kind of trade.
+- A fifth mixed model fed with a wider neighbourhood (neighbours of the parent coefficient,
+  right and bottom neighbours in already decoded bands): −0.2 %, not worth the extra decoder
+  code. Gradient-boosted trees trained on every neighbour available show that at most about 2 %
+  is left to gain in context modelling.
+- Keeping a single path in the trellis for quiet rows to speed the encoder up: little speed
+  gained, quality lost.
 
 ## What's new in version 4.1
 
@@ -129,7 +170,7 @@ they only pay off inside the mixer), parent sign as a sign context.
 Compatibility:
 
 - **Any browser** can open `.j3k` files with [`web/j3k.js`](web/j3k.js), a dependency-free
-  decoder (about 0.3 s for a 1-megapixel photo in version 4). It gives exactly the same pixels as the
+  decoder (about 0.4 s for a 1-megapixel photo). It gives exactly the same pixels as the
   Python decoder, which the tests check. On a web page:
   ```html
   <script src="j3k.js"></script>
@@ -144,7 +185,7 @@ Compatibility:
 - **Pillow plugin**: after `import jpeg3000`, `PIL.Image.open("photo.j3k")` works, so any
   Python program built on Pillow can read `.j3k`.
 - Clear errors for damaged files or files from another version (`J3K2` files need version 2:
-  `git checkout v2`; version 4 still reads `J3K3` files).
+  `git checkout v2`; version 5 still reads `J3K4` and `J3K3` files).
 
 ## Usage
 
@@ -157,6 +198,7 @@ python jpeg3000.py decode photo.j3k photo.png
 python jpeg3000.py info photo.j3k
 python test_jpeg3000.py
 python compare.py
+python tools/train_priors.py my_photos/
 ```
 
 - `--quality`: from 1 (tiny file) to 100 (almost lossless), 50 by default.
@@ -164,7 +206,11 @@ python compare.py
 - `decode` writes PNG, JPEG, WebP, TIFF or BMP depending on the extension (transparent
   images are placed on white for formats without transparency).
 - `compare.py` needs `opencv-python` and `scipy`; a format missing from your OpenCV build is skipped.
-- The test suite also checks the JavaScript decoder against the Python one when Node.js is installed.
+- The test suite also checks the JavaScript decoder against the Python one when Node.js is installed,
+  and that sample files from versions 3 and 4 still decode to the exact same pixels.
+- `tools/train_priors.py` relearns the starting probabilities from a folder of photos (add
+  `--write` to update both decoders). The table is part of the format: changing it makes
+  existing `J3K5` files unreadable, so it goes with a new format version.
 
 The command line messages are in French.
 
@@ -173,14 +219,16 @@ The command line messages are in French.
 | | JPEG (1992) | JPEG 3000 |
 |---|---|---|
 | Transform | 8x8 pixel blocks | directional CDF 9/7 wavelets over the whole image: no blocky artifacts, edges followed in 7 directions |
-| Quantization | fixed tables | step tuned to each subband, dead zone that depends on the neighbourhood, then rate-distortion optimized choice of each value |
-| Entropy coding | Huffman | adaptive binary arithmetic coding with contexts (neighbours, parent scale, sibling subbands, brightness for colours) and logistic mixing of 4 models |
+| Quantization | fixed tables | step tuned to each subband, two interleaved grids picked by a 4-state machine (dependent quantization), values chosen by a rate-distortion trellis |
+| Entropy coding | Huffman | adaptive binary arithmetic coding with contexts (neighbours, parent scale, sibling subbands, brightness for colours), logistic mixing of 4 models, starting probabilities learned on other photos |
 
 ## Limitations
 
-- It's a Python prototype: on an Apple M3, about 3 s to encode and 2.2 s to decode a
-  1-megapixel photo at quality 50 (version 4's directional wavelet and optimized quantization
-  cost time). The JavaScript decoder takes about 0.3 s.
+- It's a Python prototype: on an Apple M3, about 9 s to encode and 3 s to decode a
+  1-megapixel photo at quality 50 (version 5's trellis search makes encoding three times
+  slower than version 4.1). The JavaScript decoder takes about 0.4 s.
+- The starting probabilities were learned on only 39 small pictures; a larger and more varied
+  set would probably do a little better.
 - Only the decoder exists in JavaScript; encoding needs Python.
 - Browsers, phones and image editors don't open `.j3k` natively: you need `j3k.js`, the
   Python tool or the Pillow plugin.
